@@ -8,8 +8,8 @@ One Streamlit app, three pages:
         https://<your-app>.streamlit.app/?event=<id>
   * Pre-registration, shared before the programme (e.g. on WhatsApp):
         https://<your-app>.streamlit.app/?event=<id>&mode=register
-  * Admin portal. Tap "Admin login" at the bottom of any public page
-    (or open .../?view=admin) and enter the admin password.
+  * Admin portal (not linked from any public page, bookmark it):
+        https://<your-app>.streamlit.app/?view=admin
 
 How records are kept apart
   * Every event (Asteri, Shekinah Glory, Impromptu) has its own event_id, and
@@ -20,10 +20,16 @@ How records are kept apart
     phone number to check in on the day.
 
 Optional settings (Streamlit Cloud: Settings -> Secrets):
+    ADMIN_USERNAME = "admin"                      # main administrator
     ADMIN_PASSWORD = "your-strong-password"
     APP_BASE_URL   = "https://your-app-name.streamlit.app"
+
+Team accounts: the main administrator (and any Admin) can give trusted
+people their own sign-in from the Team tab, as an Admin or an Usher.
+Every change made in the admin portal is written to an activity log.
 """
 
+import hashlib
 import hmac
 import html
 import io
@@ -46,10 +52,15 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps, UnidentifiedImageError
 # ---------------------------------------------------------------------------
 APP_NAME = "Ignite Prayer Network"
 DB_PATH = "ignite_network.db"
-DEFAULT_ADMIN_PASSWORD = "IgniteAdmin2026"     # change before going live
+DEFAULT_ADMIN_USERNAME = "admin"              # main administrator's username
+DEFAULT_ADMIN_PASSWORD = "IgniteAdmin2026"     # change before going live (use Secrets)
+TEAM_ROLES = {
+    "Admin": "Full access: events, records, exports, backups and the team",
+    "Usher": "Event-day helper: live check-in list and manual check-in only",
+}
 EVENT_TYPES = ["Asteri", "Shekinah Glory", "Impromptu"]
 
-SUCCESS_SECONDS = 2          # how long the welcome screen stays up
+CONFIRM_SECONDS = 6          # how long the "Submitted, thank you" screen stays up
 ADMIN_SESSION_MINUTES = 30   # admin is logged out after this much idle time
 MAX_LOGIN_ATTEMPTS = 5       # wrong passwords allowed before a cool-down
 LOCKOUT_SECONDS = 60
@@ -60,6 +71,8 @@ LEDGER_REFRESH_SECONDS = 15
 BRAND = "#E4572E"            # Ignite flame orange
 BRAND_DARK = "#B83A17"
 ACCENT = "#F3A712"           # gold
+# What members see for each programme type. Change these freely.
+PUBLIC_TYPE_NAMES = {"Asteri": "Asteri", "Shekinah Glory": "Shekinah Glory", "Impromptu": "Special Meeting"}
 TYPE_COLOURS = {"Asteri": "#6C4AB6", "Shekinah Glory": "#B8860B", "Impromptu": "#1B998B"}
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
@@ -122,6 +135,28 @@ CREATE TABLE IF NOT EXISTS pre_registrations (
     event_id       INTEGER NOT NULL REFERENCES events(id),
     registered_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE (member_id, event_id)
+);
+
+-- Trusted team members with their own sign-in (the main administrator
+-- signs in with the username/password from Streamlit Secrets instead).
+CREATE TABLE IF NOT EXISTS admins (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    full_name      TEXT NOT NULL,
+    username       TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    password_hash  TEXT NOT NULL,                 -- salted PBKDF2, never the password
+    role           TEXT NOT NULL CHECK (role IN ('Admin', 'Usher')),
+    is_active      INTEGER NOT NULL DEFAULT 1,
+    created_by     TEXT,
+    created_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_login     DATETIME
+);
+
+-- Who did what, and when, in the admin portal.
+CREATE TABLE IF NOT EXISTS activity_log (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    actor   TEXT NOT NULL,
+    action  TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_attendance_event  ON attendance(event_id);
@@ -385,6 +420,12 @@ def record_pre_registration(member_id: int, event_id: int) -> bool:
         return False
 
 
+def is_pre_registered(member_id: int, event_id: int) -> bool:
+    with closing(get_conn()) as conn:
+        return conn.execute("SELECT 1 FROM pre_registrations WHERE member_id = ? AND event_id = ?",
+                            (member_id, event_id)).fetchone() is not None
+
+
 def get_ledger(event_id: int) -> pd.DataFrame:
     """Day-of check-ins for ONE event only."""
     df = query_df(
@@ -462,10 +503,109 @@ def events_summary() -> pd.DataFrame:
                     WHERE a.event_id = e.id
                       AND a.id = (SELECT MIN(a2.id) FROM attendance a2 WHERE a2.member_id = a.member_id)
                   ) AS "First-Timers",
-                  CASE WHEN e.prereg_open THEN 'Open' ELSE 'Closed' END AS "Registration",
+                  CASE WHEN e.prereg_open THEN 'On' ELSE 'Off' END AS "Pre-Registration",
                   CASE WHEN e.is_open THEN 'Open' ELSE 'Closed' END AS "Check-In"
            FROM events e
            ORDER BY COALESCE(e.event_date, date(e.created_at)) DESC, e.id DESC"""
+    )
+
+
+# ----- team accounts and activity log -------------------------------------------
+def hash_password(password: str) -> str:
+    salt = os.urandom(16)
+    iterations = 200_000
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations)
+    return f"pbkdf2_sha256${iterations}${salt.hex()}${digest.hex()}"
+
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        _, iterations, salt, expected = stored.split("$")
+        digest = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt), int(iterations))
+        return hmac.compare_digest(digest.hex(), expected)
+    except (ValueError, TypeError):
+        return False
+
+
+def owner_username() -> str:
+    return get_setting("ADMIN_USERNAME", DEFAULT_ADMIN_USERNAME).strip() or DEFAULT_ADMIN_USERNAME
+
+
+def authenticate(username: str, password: str):
+    """Returns the signed-in person as a dict, or None."""
+    username = (username or "").strip()
+    if username.casefold() == owner_username().casefold():
+        expected = get_setting("ADMIN_PASSWORD", DEFAULT_ADMIN_PASSWORD)
+        if hmac.compare_digest(password.encode(), expected.encode()):
+            return {"id": 0, "name": "Main administrator", "username": owner_username(), "role": "Owner"}
+        return None
+    with closing(get_conn()) as conn, conn:
+        row = conn.execute("SELECT * FROM admins WHERE username = ? AND is_active = 1", (username,)).fetchone()
+        if row and verify_password(password, row["password_hash"]):
+            conn.execute("UPDATE admins SET last_login = CURRENT_TIMESTAMP WHERE id = ?", (row["id"],))
+            return {"id": row["id"], "name": row["full_name"], "username": row["username"], "role": row["role"]}
+    return None
+
+
+def create_admin(full_name: str, username: str, password: str, role: str, created_by: str) -> int:
+    """Raises sqlite3.IntegrityError if the username is taken."""
+    with closing(get_conn()) as conn, conn:
+        cur = conn.execute(
+            """INSERT INTO admins (full_name, username, password_hash, role, created_by)
+               VALUES (?, ?, ?, ?, ?)""",
+            (full_name.strip(), username.strip(), hash_password(password), role, created_by),
+        )
+        return cur.lastrowid
+
+
+def get_admin(admin_id: int):
+    with closing(get_conn()) as conn:
+        row = conn.execute("SELECT * FROM admins WHERE id = ?", (admin_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def list_admins() -> pd.DataFrame:
+    return query_df(
+        """SELECT id, full_name AS "Name", username AS "Username", role AS "Role",
+                  CASE WHEN is_active THEN 'Active' ELSE 'Suspended' END AS "Status",
+                  COALESCE(created_by, '') AS "Added By",
+                  strftime('%Y-%m-%d', created_at) AS "Added",
+                  COALESCE(strftime('%Y-%m-%d %H:%M', last_login), 'Never') AS "Last Sign-In"
+           FROM admins ORDER BY is_active DESC, full_name COLLATE NOCASE"""
+    )
+
+
+def update_admin(admin_id: int, **fields):
+    allowed = {"role", "is_active", "password_hash", "full_name"}
+    cols = [c for c in fields if c in allowed]
+    with closing(get_conn()) as conn, conn:
+        conn.execute(f"UPDATE admins SET {', '.join(c + ' = ?' for c in cols)} WHERE id = ?",
+                     [fields[c] for c in cols] + [admin_id])
+
+
+def delete_admin(admin_id: int):
+    with closing(get_conn()) as conn, conn:
+        conn.execute("DELETE FROM admins WHERE id = ?", (admin_id,))
+
+
+def log_action(action: str, actor: str | None = None):
+    """Write one line to the activity log. Never lets a logging problem
+    interrupt the admin's work."""
+    if actor is None:
+        user = st.session_state.get("admin_user") or {}
+        actor = f"{user.get('name', 'Unknown')} ({user.get('role', '?')})"
+    try:
+        with closing(get_conn()) as conn, conn:
+            conn.execute("INSERT INTO activity_log (actor, action) VALUES (?, ?)", (actor, action))
+    except sqlite3.Error:
+        pass
+
+
+def activity_log(limit: int = 500) -> pd.DataFrame:
+    return query_df(
+        """SELECT strftime('%Y-%m-%d %H:%M:%S', at) AS "When (GMT)", actor AS "Who", action AS "What"
+           FROM activity_log ORDER BY id DESC LIMIT ?""",
+        (limit,),
     )
 
 
@@ -547,6 +687,11 @@ def event_label(ev: dict) -> str:
     if ev.get("event_date"):
         parts.append(fmt_date(ev["event_date"]))
     return " · ".join(parts)
+
+
+def public_label(ev: dict) -> str:
+    """Event name (and date) for members, without the internal event type."""
+    return ev["event_name"] + (f" · {fmt_date(ev['event_date'])}" if ev.get("event_date") else "")
 
 
 def safe_filename(text: str) -> str:
@@ -767,6 +912,31 @@ def inject_css(public: bool):
           .st-key-admin_entry .stButton {{display:flex; justify-content:center;}}
           [data-baseweb="tab-highlight"] {{background-color:{BRAND};}}
           .stTabs [aria-selected="true"] p {{color:{BRAND};}}
+          .ig-flame-svg {{width:2rem; height:2.4rem; color:#fff; filter:drop-shadow(0 2px 6px rgba(0,0,0,.2));}}
+          .ig-compact .ig-flame-svg {{width:1.7rem; height:2rem;}}
+          .ig-ico {{width:1rem; height:1rem; vertical-align:-2px; margin-right:.35rem; opacity:.85;}}
+          .ig-event-meta span {{display:inline-block; margin-right:1.1rem; margin-top:.15rem;}}
+          .ig-lead {{font-size:1.05rem; font-weight:600; margin:.2rem 0 .3rem;}}
+          .ig-note {{font-size:.9rem; opacity:.8; margin-bottom:.6rem; line-height:1.5;}}
+          .ig-form-note {{font-size:.88rem; opacity:.75; margin-bottom:.2rem; line-height:1.5;}}
+          .ig-section {{font-size:.78rem; font-weight:700; letter-spacing:.08em; text-transform:uppercase;
+                        color:{BRAND}; margin:.9rem 0 .1rem; padding-top:.6rem;
+                        border-top:1px solid rgba(128,128,128,.2);}}
+
+          /* Confirmation ("Submitted · thank you") screen */
+          .ig-done {{text-align:center; padding:2.2rem 1.4rem 2rem; border-radius:24px; color:#fff; margin:.6rem 0 1rem;
+                     background:linear-gradient(160deg,#1B998B 0%,#127A6F 100%); box-shadow:0 10px 30px rgba(18,122,111,.35);}}
+          .ig-done-info {{background:linear-gradient(160deg,#3D5A80 0%,#2B4162 100%); box-shadow:0 10px 30px rgba(43,65,98,.35);}}
+          .ig-done-brand {{display:flex; align-items:center; justify-content:center; gap:.45rem;
+                           font-weight:600; font-size:.9rem; opacity:.9; margin-bottom:1.3rem;}}
+          .ig-done-brand .ig-flame-svg {{width:1.1rem; height:1.35rem; filter:none;}}
+          .ig-done-ico {{width:4.2rem; height:4.2rem; color:#fff; display:block; margin:0 auto .9rem;}}
+          .ig-done-kicker {{font-size:.78rem; font-weight:700; letter-spacing:.14em; text-transform:uppercase; opacity:.85;}}
+          .ig-done h2 {{color:#fff; font-size:1.75rem; margin:.35rem 0 .5rem; padding:0;}}
+          .ig-done p {{font-size:1.02rem; line-height:1.55; margin:0 auto; max-width:30rem; opacity:.95;}}
+          .ig-done-meta {{margin-top:1.3rem; font-size:.82rem; opacity:.8; padding-top:1rem;
+                          border-top:1px solid rgba(255,255,255,.25);}}
+          .st-key-ig_scroll {{display:none;}}
           .ig-footer {{text-align:center; opacity:.55; font-size:.8rem; margin-top:.4rem;}}
         </style>
         """,
@@ -774,25 +944,44 @@ def inject_css(public: bool):
     )
 
 
+# ----- small inline icons (crisp on every phone, no emoji differences) ----------
+ICON_FLAME = ('<svg class="ig-flame-svg" viewBox="0 0 24 30" aria-hidden="true">'
+              '<path d="M12 1c.6 5.2-6.5 8.4-6.5 16.2A6.5 6.5 0 0 0 12 23.7a6.5 6.5 0 0 0 6.5-6.5'
+              'c0-3.6-1.9-6-3.1-7.6-.2 2.6-1.3 4-2.8 4.6C13.4 10.7 13.3 5.6 12 1z" fill="currentColor"/></svg>')
+ICON_CAL = ('<svg class="ig-ico" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M7 2h2v2h6V2h2v2h2'
+            'a2 2 0 0 1 2 2v13a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2V2zm12 8H5v9h14v-9z"/></svg>')
+ICON_PIN = ('<svg class="ig-ico" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2a7 7 0 0 1 7 7'
+            'c0 5.2-7 13-7 13S5 14.2 5 9a7 7 0 0 1 7-7zm0 4.5A2.5 2.5 0 1 0 12 11.5 2.5 2.5 0 0 0 12 6.5z"/></svg>')
+ICON_CHECK = ('<svg class="ig-done-ico" viewBox="0 0 52 52" aria-hidden="true"><circle cx="26" cy="26" r="25" '
+              'fill="none" stroke="currentColor" stroke-width="2.5"/><path d="M15 27l7 7 15-16" fill="none" '
+              'stroke="currentColor" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/></svg>')
+ICON_INFO = ('<svg class="ig-done-ico" viewBox="0 0 52 52" aria-hidden="true"><circle cx="26" cy="26" r="25" '
+             'fill="none" stroke="currentColor" stroke-width="2.5"/><path d="M26 23v13M26 16v.5" fill="none" '
+             'stroke="currentColor" stroke-width="4" stroke-linecap="round"/></svg>')
+
+
 def brand_header(subtitle: str = "", compact: bool = False):
     cls = "ig-hero ig-compact" if compact else "ig-hero"
     inner = (f'<div><div class="ig-title">{APP_NAME}</div><div class="ig-sub">{esc(subtitle)}</div></div>'
              if compact else
              f'<div class="ig-title">{APP_NAME}</div><div class="ig-sub">{esc(subtitle)}</div>')
-    st.markdown(f'<div class="{cls}"><div class="ig-flame">🔥</div>{inner}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="{cls}"><div class="ig-flame">{ICON_FLAME}</div>{inner}</div>', unsafe_allow_html=True)
 
 
-def event_card(ev: dict):
+def event_card(ev: dict, public: bool = False):
+    """Event name, programme, date and venue. Members see the friendly
+    programme name (e.g. "Special Meeting" instead of "Impromptu")."""
     colour = TYPE_COLOURS.get(ev["event_type"], BRAND)
-    meta = " &nbsp;·&nbsp; ".join(
+    type_name = PUBLIC_TYPE_NAMES.get(ev["event_type"], ev["event_type"]) if public else ev["event_type"]
+    meta = "".join(
         p for p in (
-            f"📅 {esc(fmt_date(ev.get('event_date')))}" if ev.get("event_date") else "",
-            f"📍 {esc(ev.get('venue'))}" if ev.get("venue") else "",
+            f'<span>{ICON_CAL}{esc(fmt_date(ev.get("event_date")))}</span>' if ev.get("event_date") else "",
+            f'<span>{ICON_PIN}{esc(ev.get("venue"))}</span>' if ev.get("venue") else "",
         ) if p
     )
     st.markdown(
         f"""<div class="ig-event">
-              <span class="ig-badge" style="background:{colour}">{esc(ev['event_type'])}</span>
+              <span class="ig-badge" style="background:{colour}">{esc(type_name)}</span>
               <div class="ig-event-name">{esc(ev['event_name'])}</div>
               {f'<div class="ig-event-meta">{meta}</div>' if meta else ''}
             </div>""",
@@ -803,45 +992,95 @@ def event_card(ev: dict):
 # ---------------------------------------------------------------------------
 # Public pages: shared pieces
 # ---------------------------------------------------------------------------
-def flash_and_reset(kind: str, title: str, message: str):
-    """Store the message, bump the form counter (new widget keys mean blank
-    forms) and rerun. The next run shows ONLY the message, then the form."""
-    st.session_state.flash = (kind, title, message)
+def confirm_and_reset(kind: str, title: str, message: str, ev: dict):
+    """Record what to show on the confirmation screen, throw away the form
+    (a new form counter means brand-new, empty widgets) and rerun."""
+    st.session_state.confirmation = {
+        "kind": kind, "title": title, "message": message,
+        "event": ev["event_name"], "time": datetime.now(timezone.utc).strftime("%H:%M"),
+        "shown_at": None,
+    }
     st.session_state.form_nonce += 1
     st.rerun()
 
 
-def show_flash_if_any():
-    """Privacy screen: while the message is up, nothing else is drawn."""
-    if "flash" not in st.session_state:
-        return
-    kind, title, message = st.session_state.pop("flash")
-    css, icon = ("ig-success", "✅") if kind == "success" else ("ig-notice", "👋")
-    placeholder = st.empty()
-    placeholder.markdown(
-        f'<div class="{css}"><div class="ig-check">{icon}</div><h2>{esc(title)}</h2><p>{esc(message)}</p></div>',
+def scroll_to_top():
+    """Bring the page back to the top so the confirmation is the first thing seen."""
+    script = """<script>
+        const d = window.parent.document;
+        for (const sel of ['[data-testid="stMain"]', '[data-testid="stAppViewContainer"]', 'section.main']) {
+            const el = d.querySelector(sel); if (el) el.scrollTo({top: 0, behavior: 'instant'});
+        }
+        window.parent.scrollTo(0, 0);
+        </script>"""
+    with st.container(key="ig_scroll"):          # hidden by CSS; the script still runs
+        if hasattr(st, "iframe"):
+            st.iframe(script, height=1)
+        else:                                    # older Streamlit versions
+            st.components.v1.html(script, height=0)
+
+
+def show_confirmation() -> bool:
+    """Privacy screen: after a submission the whole page is replaced by this
+    card. No personal details are shown. It resets itself after a few
+    seconds (or when "Done" is tapped), ready for the next person."""
+    c = st.session_state.get("confirmation")
+    if not c:
+        return False
+    if c["shown_at"] is None:
+        c["shown_at"] = time.time()
+
+    css, icon = ("ig-done", ICON_CHECK) if c["kind"] == "success" else ("ig-done ig-done-info", ICON_INFO)
+    st.markdown(
+        f"""<div class="{css}">
+              <div class="ig-done-brand">{ICON_FLAME}<span>{APP_NAME}</span></div>
+              {icon}
+              <div class="ig-done-kicker">Submitted · thank you</div>
+              <h2>{esc(c['title'])}</h2>
+              <p>{esc(c['message'])}</p>
+              <div class="ig-done-meta">{esc(c['event'])} &nbsp;·&nbsp; recorded at {c['time']} GMT</div>
+            </div>""",
         unsafe_allow_html=True,
     )
-    time.sleep(SUCCESS_SECONDS)
-    placeholder.empty()
-    st.rerun()
+    scroll_to_top()
+    if st.button("Done", type="primary", width="stretch", key="confirm_done"):
+        st.session_state.pop("confirmation", None)
+        st.rerun()
+
+    @st.fragment(run_every=1)
+    def countdown():
+        left = CONFIRM_SECONDS - int(time.time() - c["shown_at"])
+        if left <= 0:
+            st.session_state.pop("confirmation", None)
+            st.rerun(scope="app")
+        st.markdown(f'<div class="ig-footer">This screen will reset in {left} second{"s" if left != 1 else ""}.</div>',
+                    unsafe_allow_html=True)
+
+    countdown()
+    return True
 
 
-def phone_lookup_form(prefix: str, caption: str, not_found_hint: str):
+def show_errors(errors: list[str]):
+    st.error("**Please check the following:**\n\n" + "\n".join(f"- {e}" for e in errors))
+
+
+def phone_lookup_form(prefix: str, caption: str, button_label: str, not_found_hint: str):
     """Returns a member id after a valid submit, otherwise None."""
     nonce = st.session_state.form_nonce
     with st.form(key=f"{prefix}_quick_{nonce}"):
-        st.caption(caption)
+        st.markdown(f'<div class="ig-form-note">{esc(caption)}</div>', unsafe_allow_html=True)
         phone_raw = st.text_input("Phone number", placeholder="e.g. 024 123 4567",
                                   autocomplete="off", key=f"{prefix}_q_phone_{nonce}")
-        submitted = st.form_submit_button("Continue" if prefix == "reg" else "Submit Check-In",
-                                          type="primary", width="stretch")
+        submitted = st.form_submit_button(button_label, type="primary", width="stretch")
     if not submitted:
         return None
     phone = normalize_phone(phone_raw)
-    member_id = find_member_id(phone) if is_valid_phone(phone) else None
+    if not is_valid_phone(phone):
+        show_errors(["Please enter a valid phone number, e.g. 024 123 4567."])
+        return None
+    member_id = find_member_id(phone)
     if member_id is None:
-        st.error(f"We couldn't find that number. {not_found_hint}")
+        show_errors([f"We couldn't find {phone_raw.strip()} in our records. {not_found_hint}"])
     return member_id
 
 
@@ -851,24 +1090,31 @@ def new_member_form(prefix: str, button_label: str):
     nonce = st.session_state.form_nonce
     k = lambda name: f"{prefix}_{name}_{nonce}"
     with st.form(key=k("register")):
-        st.caption("Fill this in once. After that you'll only ever need your phone number.")
-        full_name = st.text_input("Full name *", autocomplete="off", key=k("name"))
+        st.markdown('<div class="ig-form-note">Fill this in once. Next time you\'ll only need your phone number. '
+                    'Fields marked * are required.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="ig-section">Your details</div>', unsafe_allow_html=True)
+        full_name = st.text_input("Full name *", placeholder="e.g. Ama Serwaa Mensah", autocomplete="off", key=k("name"))
         c1, c2 = st.columns(2)
-        phone_raw = c1.text_input("Phone number *", autocomplete="off", key=k("phone"))
-        whatsapp_raw = c2.text_input("WhatsApp (if different)", autocomplete="off", key=k("wa"))
-        email = st.text_input("Email (optional)", autocomplete="off", key=k("email"))
+        phone_raw = c1.text_input("Phone number *", placeholder="e.g. 024 123 4567", autocomplete="off", key=k("phone"))
+        whatsapp_raw = c2.text_input("WhatsApp number", placeholder="Leave blank if the same",
+                                     autocomplete="off", key=k("wa"))
+        email = st.text_input("Email address", placeholder="Optional", autocomplete="off", key=k("email"))
 
-        st.markdown("**Emergency contact**")
+        st.markdown('<div class="ig-section">Emergency contact</div>', unsafe_allow_html=True)
         c3, c4 = st.columns(2)
-        ec_name = c3.text_input("Contact name *", autocomplete="off", key=k("ecn"))
-        ec_phone_raw = c4.text_input("Contact phone *", autocomplete="off", key=k("ecp"))
+        ec_name = c3.text_input("Contact name *", placeholder="Who should we call?", autocomplete="off", key=k("ecn"))
+        ec_phone_raw = c4.text_input("Contact phone *", placeholder="e.g. 020 123 4567",
+                                     autocomplete="off", key=k("ecp"))
 
-        is_minor = st.checkbox("I am under 18", key=k("minor"))
-        parent_raw = st.text_input("Parent/guardian phone (required if under 18)",
+        st.markdown('<div class="ig-section">Under 18?</div>', unsafe_allow_html=True)
+        is_minor = st.checkbox("I am under 18 years old", key=k("minor"))
+        parent_raw = st.text_input("Parent/guardian phone", placeholder="Required if you are under 18",
                                    autocomplete="off", key=k("par"))
+
+        st.markdown('<div class="ig-section">Consent</div>', unsafe_allow_html=True)
         consent = st.checkbox(
-            f"I agree that {APP_NAME} may keep these details for attendance records and to "
-            "contact my emergency contact or parent/guardian if needed. *",
+            f"I agree that {APP_NAME} may keep these details for attendance records and may contact "
+            "my emergency contact or parent/guardian if needed. *",
             key=k("consent"),
         )
         submitted = st.form_submit_button(button_label, type="primary", width="stretch")
@@ -882,26 +1128,25 @@ def new_member_form(prefix: str, button_label: str):
 
     errors = []
     if len(full_name.strip()) < 2:
-        errors.append("Please enter your full name.")
+        errors.append("Enter your full name.")
     if not is_valid_phone(phone):
-        errors.append("Please enter a valid phone number.")
+        errors.append("Enter a valid phone number.")
     if whatsapp_raw.strip() and not is_valid_phone(whatsapp):
         errors.append("The WhatsApp number doesn't look right.")
     if email.strip() and not is_valid_email(email):
         errors.append("The email address doesn't look right.")
     if not ec_name.strip():
-        errors.append("Please enter an emergency contact name.")
+        errors.append("Enter an emergency contact name.")
     if not is_valid_phone(ec_phone):
-        errors.append("Please enter a valid emergency contact phone.")
+        errors.append("Enter a valid emergency contact phone number.")
     if is_minor and not parent:
         errors.append("A parent/guardian phone number is required for anyone under 18.")
     if parent and not is_valid_phone(parent):
-        errors.append("The parent/guardian phone doesn't look right.")
+        errors.append("The parent/guardian phone number doesn't look right.")
     if not consent:
-        errors.append("Please tick the consent box so we can keep your details.")
+        errors.append("Tick the consent box so we can keep your details.")
     if errors:
-        for e in errors:
-            st.error(e)
+        show_errors(errors)
         return None
 
     member_id = find_member_id(phone)
@@ -931,16 +1176,13 @@ def show_event_header(banner, ev: dict):
     flyer = get_flyer(ev["id"])
     if flyer:
         banner.image(flyer, width="stretch")
-    event_card(ev)
+    event_card(ev, public=True)
 
 
 def public_footer():
+    # No admin button here on purpose: admins open the private link
+    # https://<your-app>.streamlit.app/?view=admin (bookmark it).
     st.write("")
-    st.divider()
-    with st.container(key="admin_entry"):
-        if st.button("🔒 Admin login", key="open_admin", type="tertiary"):
-            st.session_state.show_admin = True
-            st.rerun()
     st.markdown(f'<div class="ig-footer">© {datetime.now().year} {APP_NAME}</div>', unsafe_allow_html=True)
 
 
@@ -954,58 +1196,67 @@ def resolve_checkin_event():
         ev = get_event(int(raw))
         if ev:
             return ev
-        st.warning("That check-in link isn't valid any more. Please pick your event below.")
+        st.warning("That check-in link is no longer valid. Please choose your programme below.")
     events = get_events(open_only=True)
     if not events:
-        st.info("There are no events open for check-in right now. Please check back later.")
+        st.info("There are no programmes open for check-in right now. Please check back later.")
         return None
     if len(events) == 1:
         return events[0]
-    return st.selectbox("Which event are you attending?", events, format_func=event_label)
+    return st.selectbox("Which programme are you attending?", events, format_func=public_label)
 
 
 def checkin_page():
-    show_flash_if_any()
-    banner = page_top("Event Check-In")
+    if show_confirmation():
+        return
+    banner = page_top("Arrival Check-In")
     ev = resolve_checkin_event()
     if ev is None:
         return
     show_event_header(banner, ev)
 
     if not ev["is_open"]:
-        st.warning("Check-in for this event is closed. Please speak to an usher if you need help.")
+        st.warning("Check-in for this programme is closed. Please speak to an usher if you need help.")
         return
 
-    tab_returning, tab_new = st.tabs(["✅  Returning / pre-registered", "📝  First time here"])
+    st.markdown('<div class="ig-lead">Welcome! Please confirm your arrival below.</div>', unsafe_allow_html=True)
+    tab_returning, tab_new = st.tabs([
+        ":material/how_to_reg: " + ("Registered / attended before" if ev["prereg_open"] else "Attended Ignite before"),
+        ":material/person_add: First time with Ignite"])
+    already = ("You're already checked in",
+               "Your arrival for this programme was recorded earlier, so there's nothing more to do. Enjoy the programme!")
     with tab_returning:
         member_id = phone_lookup_form(
-            "chk", "Registered before, or signed up online? Just enter your phone number.",
-            "If it's your first time, use the “First time here” tab.")
+            "chk", ("Registered online for this programme, or attended Ignite before? "
+                    if ev["prereg_open"] else "Been with Ignite before? ") + "Just enter your phone number.",
+            "Check In",
+            "If this is your first time with Ignite, please use the “First time with Ignite” tab.")
         if member_id:
             if record_check_in(member_id, ev["id"]):
-                flash_and_reset("success", "Success! Welcome to Ignite Network",
-                                "Your attendance has been recorded. Enjoy the service!")
+                msg = ("You registered ahead of time, and your arrival is now confirmed. Enjoy the programme!"
+                       if is_pre_registered(member_id, ev["id"])
+                       else "Your arrival has been recorded. Enjoy the programme!")
+                confirm_and_reset("success", "Welcome to Ignite Network!", msg, ev)
             else:
-                flash_and_reset("info", "You're already checked in",
-                                "Your earlier check-in for this event is still on record.")
+                confirm_and_reset("info", *already, ev)
     with tab_new:
-        result = new_member_form("chk", "Submit Check-In")
+        result = new_member_form("chk", "Submit & Check In")
         if result:
             member_id, is_new = result
-            msg = ("You're registered and checked in. We're glad you're here!" if is_new
-                   else "This number was already registered, so we've checked you in.")
+            msg = ("Your details have been saved and your arrival is recorded. We're glad you're here!" if is_new
+                   else "This phone number was already on our records, so we've simply checked you in.")
             if record_check_in(member_id, ev["id"]):
-                flash_and_reset("success", "Success! Welcome to Ignite Network", msg)
+                confirm_and_reset("success", "Welcome to Ignite Network!", msg, ev)
             else:
-                flash_and_reset("info", "You're already checked in",
-                                "Your earlier check-in for this event is still on record.")
+                confirm_and_reset("info", *already, ev)
 
 
 # ---------------------------------------------------------------------------
 # Public page: pre-registration (shared before the day)
 # ---------------------------------------------------------------------------
 def register_page():
-    show_flash_if_any()
+    if show_confirmation():
+        return
     banner = page_top("Pre-Registration")
 
     raw = st.query_params.get("event")
@@ -1016,45 +1267,74 @@ def register_page():
     show_event_header(banner, ev)
 
     if not ev["prereg_open"]:
-        st.warning("Registration for this event has closed. You can still check in at the venue on the day.")
+        st.info("This programme doesn't need pre-registration. Just come along on the day and scan "
+                "the QR code at the entrance to check in.", icon=":material/info:")
         return
 
-    st.markdown("**Reserve your place.** On the day, scan the check-in QR code at the entrance "
-                "and just enter your phone number.")
-    tab_known, tab_new = st.tabs(["✅  I've registered with Ignite before", "📝  I'm new"])
-    done_msg = f"You're registered for {ev['event_name']}. See you there!"
+    st.markdown(
+        '<div class="ig-lead">Let us know you\'re coming so we can prepare for you.</div>'
+        '<div class="ig-note">This reserves your place; it isn\'t your check-in. On the day, scan the QR code '
+        'at the entrance and enter your phone number to confirm you\'ve arrived.</div>',
+        unsafe_allow_html=True,
+    )
+    tab_known, tab_new = st.tabs([":material/how_to_reg: I've attended Ignite before",
+                                  ":material/person_add: I'm new to Ignite"])
+    done_title = "You're registered!"
+    done_msg = "Your place is reserved. On the day, scan the QR code at the entrance and enter your phone number."
+    already = ("You're already registered", "We already have your registration for this programme. See you there!")
     with tab_known:
         member_id = phone_lookup_form(
-            "reg", "Enter the phone number you used before.",
-            "If you haven't registered with us before, use the “I'm new” tab.")
+            "reg", "Enter the phone number you gave us before. We already have your other details.",
+            "Register",
+            "If you haven't been with us before, please use the “I'm new to Ignite” tab.")
         if member_id:
             if record_pre_registration(member_id, ev["id"]):
-                flash_and_reset("success", "You're registered! 🎉", done_msg)
+                confirm_and_reset("success", done_title, done_msg, ev)
             else:
-                flash_and_reset("info", "You're already registered", done_msg)
+                confirm_and_reset("info", *already, ev)
     with tab_new:
-        result = new_member_form("reg", "Register")
+        result = new_member_form("reg", "Submit Registration")
         if result:
             member_id, _ = result
             if record_pre_registration(member_id, ev["id"]):
-                flash_and_reset("success", "You're registered! 🎉", done_msg)
+                confirm_and_reset("success", done_title, done_msg, ev)
             else:
-                flash_and_reset("info", "You're already registered", done_msg)
+                confirm_and_reset("info", *already, ev)
 
 
 # ---------------------------------------------------------------------------
 # Admin: access
 # ---------------------------------------------------------------------------
+def current_admin() -> dict:
+    return st.session_state.get("admin_user") or {}
+
+
+def end_admin_session():
+    for key in ("admin_expires", "admin_user"):
+        st.session_state.pop(key, None)
+
+
 def admin_is_authenticated() -> bool:
-    if st.session_state.get("admin_expires", 0) > time.time():
-        st.session_state.admin_expires = time.time() + ADMIN_SESSION_MINUTES * 60
-        return True
-    st.session_state.pop("admin_expires", None)
-    return False
+    """Valid session, not idle too long, and (for team members) the account
+    is still active. Role changes made by another admin apply straight away."""
+    user = st.session_state.get("admin_user")
+    if not user or st.session_state.get("admin_expires", 0) <= time.time():
+        end_admin_session()
+        return False
+    if user["id"]:
+        fresh = get_admin(user["id"])
+        if not fresh or not fresh["is_active"]:
+            end_admin_session()
+            return False
+        user["role"], user["name"] = fresh["role"], fresh["full_name"]
+    st.session_state.admin_expires = time.time() + ADMIN_SESSION_MINUTES * 60
+    return True
 
 
 def leave_admin():
-    st.session_state.pop("admin_expires", None)
+    if current_admin():
+        log_action("Signed out")
+    end_admin_session()
     st.session_state.show_admin = False
     if "view" in st.query_params:
         del st.query_params["view"]
@@ -1066,31 +1346,35 @@ def admin_login():
     locked_until = st.session_state.get("locked_until", 0)
     if locked_until > time.time():
         st.error(f"Too many attempts. Try again in {int(locked_until - time.time())} seconds.")
-    else:
-        with st.form("admin_login", clear_on_submit=True):
-            st.markdown("**Sign in to manage events and attendance**")
-            pw = st.text_input("Admin password", type="password")
-            go = st.form_submit_button("Unlock", type="primary", width="stretch")
-        if go:
-            expected = get_setting("ADMIN_PASSWORD", DEFAULT_ADMIN_PASSWORD)
-            if hmac.compare_digest(pw.encode(), expected.encode()):
-                st.session_state.admin_expires = time.time() + ADMIN_SESSION_MINUTES * 60
+        return
+    with st.form("admin_login", clear_on_submit=True):
+        st.markdown("**Sign in to manage events and attendance**")
+        username = st.text_input("Username", autocomplete="username")
+        pw = st.text_input("Password", type="password", autocomplete="current-password")
+        go = st.form_submit_button("Sign in", type="primary", width="stretch")
+    if go:
+        user = authenticate(username, pw)
+        if user:
+            st.session_state.admin_user = user
+            st.session_state.admin_expires = time.time() + ADMIN_SESSION_MINUTES * 60
+            st.session_state.failed_logins = 0
+            log_action("Signed in")
+            st.rerun()
+        else:
+            time.sleep(1)
+            log_action(f"Failed sign-in attempt for username “{username.strip()[:40]}”", actor="Unknown")
+            st.session_state.failed_logins = st.session_state.get("failed_logins", 0) + 1
+            if st.session_state.failed_logins >= MAX_LOGIN_ATTEMPTS:
+                st.session_state.locked_until = time.time() + LOCKOUT_SECONDS
                 st.session_state.failed_logins = 0
-                st.rerun()
-            else:
-                time.sleep(1)
-                st.session_state.failed_logins = st.session_state.get("failed_logins", 0) + 1
-                if st.session_state.failed_logins >= MAX_LOGIN_ATTEMPTS:
-                    st.session_state.locked_until = time.time() + LOCKOUT_SECONDS
-                    st.session_state.failed_logins = 0
-                st.error("Incorrect password.")
-    if st.button("← Back to check-in", key="back_to_checkin", type="tertiary"):
-        leave_admin()
+            st.error("Incorrect username or password.")
 
 
 def notify(message: str):
-    """Show a confirmation at the top of the admin page after a rerun."""
+    """Show a confirmation at the top of the admin page after a rerun,
+    and record the action in the activity log."""
     st.session_state.admin_notice = message
+    log_action(message)
 
 
 def event_picker(label: str, key: str, events: list[dict]) -> dict:
@@ -1105,9 +1389,9 @@ def event_picker(label: str, key: str, events: list[dict]) -> dict:
 
 def download_pair(df: pd.DataFrame, stem: str, sheet: str, key: str):
     c1, c2 = st.columns(2)
-    c1.download_button("⬇️  Export CSV", df.to_csv(index=False).encode("utf-8"), file_name=f"{stem}.csv",
+    c1.download_button("Export CSV", df.to_csv(index=False).encode("utf-8"), file_name=f"{stem}.csv",
                        mime="text/csv", width="stretch", key=f"{key}_csv")
-    c2.download_button("⬇️  Export Excel", to_excel_bytes(df, sheet), file_name=f"{stem}.xlsx",
+    c2.download_button("Export Excel", to_excel_bytes(df, sheet), file_name=f"{stem}.xlsx",
                        mime=XLSX_MIME, width="stretch", key=f"{key}_xlsx")
 
 
@@ -1133,8 +1417,8 @@ def overview_tab():
     c[3].metric("Total check-ins", s["checkins"])
     c[4].metric("Check-ins today", s["today"])
 
-    st.info("💾 Free hosting can wipe the database when the app restarts or updates. "
-            "Download a backup from the **Backup** tab after every event.")
+    st.info("Free hosting can wipe the database when the app restarts or updates. "
+            "Download a backup from the **Backup** tab after every event.", icon=":material/backup:")
 
     summary = events_summary()
     if summary.empty:
@@ -1150,7 +1434,7 @@ def overview_tab():
 
 
 def create_event_section(has_events: bool):
-    with st.expander("➕  Create a new event", expanded=not has_events):
+    with st.expander(":material/add_circle: Create a new event", expanded=not has_events):
         with st.form("new_event", clear_on_submit=True):
             c1, c2 = st.columns(2)
             ev_type = c1.selectbox("Event type", EVENT_TYPES)
@@ -1160,7 +1444,8 @@ def create_event_section(has_events: bool):
             venue = c4.text_input("Venue (optional)")
             flyer_file = st.file_uploader("Programme flyer (optional, JPEG or PNG)", type=["jpg", "jpeg", "png"])
             c5, c6 = st.columns(2)
-            prereg_open = c5.toggle("Open pre-registration", value=True)
+            prereg_open = c5.toggle("Use pre-registration", value=True,
+                                    help="Turn off for attendance-only events. Members then simply check in on the day.")
             is_open = c6.toggle("Open day-of check-in", value=True)
             create = st.form_submit_button("Create event", type="primary")
         if create:
@@ -1173,7 +1458,8 @@ def create_event_section(has_events: bool):
             new_id = create_event(name, ev_type, ev_date.isoformat() if ev_date else None,
                                   venue, flyer, is_open, prereg_open)
             st.session_state.manage_event = new_id
-            notify(f"Created “{name}”. Its registration link and check-in QR code are ready below.")
+            notify(f"Created “{name}”. " + ("Its registration link and check-in QR code are ready below."
+                                             if prereg_open else "It's attendance-only; its check-in QR code is ready below."))
             st.rerun()
 
 
@@ -1195,21 +1481,28 @@ def poster_block(ev: dict, link: str, heading: str, cta: str, stem: str, key: st
     poster = make_poster(link, ev["event_name"], ev["event_type"], fmt_date(ev["event_date"]),
                          ev["venue"] or "", heading, cta)
     st.image(poster, caption="Printable poster (A4)", width="stretch")
-    st.download_button("⬇️  Download poster (A4 PNG)", poster, file_name=f"{stem}.png",
+    st.download_button("Download poster (A4 PNG)", poster, file_name=f"{stem}.png",
                        mime="image/png", width="stretch", key=f"{key}_poster")
-    st.download_button("⬇️  Download QR code only", to_png(make_qr_image(link)),
+    st.download_button("Download QR code only", to_png(make_qr_image(link)),
                        file_name=f"{stem}_QR.png", mime="image/png", width="stretch", key=f"{key}_qr")
 
 
 def prereg_section(ev: dict, base):
-    status = "🟢 Registration is open" if ev["prereg_open"] else "🔴 Registration is closed"
     c1, c2 = st.columns([3, 1])
-    c1.markdown(f"{status} · **{ev['preregs']}** registered so far")
-    if c2.button("Close registration" if ev["prereg_open"] else "Reopen registration",
+    if ev["prereg_open"]:
+        c1.markdown(f":green[●] **Pre-registration is on** · {ev['preregs']} registered so far")
+    else:
+        c1.markdown(":gray[●] **Pre-registration is off.** This is an attendance-only event: "
+                    "members simply check in on the day.")
+    if c2.button("Turn off pre-registration" if ev["prereg_open"] else "Turn on pre-registration",
                  key=f"toggle_prereg_{ev['id']}", width="stretch"):
         set_event_flag(ev["id"], "prereg_open", not ev["prereg_open"])
-        notify("Pre-registration closed." if ev["prereg_open"] else "Pre-registration reopened.")
+        notify(f"Pre-registration turned {'off' if ev['prereg_open'] else 'on'} for “{ev['event_name']}”.")
         st.rerun()
+    if not ev["prereg_open"]:
+        if ev["preregs"]:
+            st.caption(f"The {ev['preregs']} registration(s) made earlier are kept in the Pre-registrations tab.")
+        return
     if not base:
         st.warning("Set the app address above to get the registration link.")
         return
@@ -1228,7 +1521,7 @@ def prereg_section(ev: dict, base):
         st.code(link, language=None)
         st.markdown("**Ready-made message** (tap the copy icon, then paste into WhatsApp)")
         st.code(message, language=None, wrap_lines=True)
-        st.link_button("💬  Share on WhatsApp", f"https://wa.me/?text={quote(message)}",
+        st.link_button("Share on WhatsApp", f"https://wa.me/?text={quote(message)}",
                        type="primary", width="stretch")
     with right:
         poster_block(ev, link, "Register Now", "Scan to register for this event",
@@ -1236,13 +1529,13 @@ def prereg_section(ev: dict, base):
 
 
 def checkin_qr_section(ev: dict, base):
-    status = "🟢 Check-in is open" if ev["is_open"] else "🔴 Check-in is closed"
+    status = ":green[●] **Check-in is open**" if ev["is_open"] else ":red[●] **Check-in is closed**"
     c1, c2 = st.columns([3, 1])
-    c1.markdown(f"{status} · **{ev['attendees']}** checked in")
+    c1.markdown(f"{status} · {ev['attendees']} checked in")
     if c2.button("Close check-in" if ev["is_open"] else "Reopen check-in",
                  key=f"toggle_open_{ev['id']}", width="stretch"):
         set_event_flag(ev["id"], "is_open", not ev["is_open"])
-        notify("Check-in closed." if ev["is_open"] else "Check-in reopened.")
+        notify(f"Check-in {'closed' if ev['is_open'] else 'reopened'} for “{ev['event_name']}”.")
         st.rerun()
     if not base:
         st.warning("Set the app address above to get the check-in QR code.")
@@ -1270,7 +1563,8 @@ def details_section(ev: dict):
         ev_date = c3.date_input("Date", value=current_date, format="DD/MM/YYYY")
         venue = c4.text_input("Venue", value=ev["venue"] or "")
         c5, c6 = st.columns(2)
-        prereg_open = c5.toggle("Pre-registration open", value=bool(ev["prereg_open"]))
+        prereg_open = c5.toggle("Use pre-registration", value=bool(ev["prereg_open"]),
+                                help="Turn off for attendance-only events.")
         is_open = c6.toggle("Day-of check-in open", value=bool(ev["is_open"]),
                             help="Turn this off after the event so no one can check in late.")
         save = st.form_submit_button("Save changes", type="primary")
@@ -1280,7 +1574,7 @@ def details_section(ev: dict):
         else:
             update_event(ev["id"], name, ev_type, ev_date.isoformat() if ev_date else None,
                          venue, is_open, prereg_open)
-            notify("Event details saved.")
+            notify(f"Saved changes to “{name.strip()}”.")
             st.rerun()
 
 
@@ -1300,13 +1594,13 @@ def flyer_section(ev: dict):
         else:
             try:
                 set_event_flyer(ev["id"], prepare_flyer(new_file))
-                notify("Flyer saved.")
+                notify(f"Flyer updated for “{ev['event_name']}”.")
                 st.rerun()
             except ValueError as err:
                 st.error(str(err))
     if current and st.button("Remove flyer", key=f"remove_flyer_{ev['id']}"):
         set_event_flyer(ev["id"], None)
-        notify("Flyer removed.")
+        notify(f"Flyer removed from “{ev['event_name']}”.")
         st.rerun()
 
 
@@ -1319,18 +1613,18 @@ def delete_section(ev: dict):
     stem = safe_filename(ev["event_name"])
     c1, c2 = st.columns(2)
     if ev["attendees"]:
-        c1.download_button("⬇️  Export check-ins first (Excel)", to_excel_bytes(get_ledger(ev["id"]), "Check-ins"),
+        c1.download_button("Export check-ins first (Excel)", to_excel_bytes(get_ledger(ev["id"]), "Check-ins"),
                            file_name=f"{stem}_checkins.xlsx", mime=XLSX_MIME,
                            key=f"pre_delete_chk_{ev['id']}", width="stretch")
     if ev["preregs"]:
-        c2.download_button("⬇️  Export pre-registrations first (Excel)",
+        c2.download_button("Export pre-registrations first (Excel)",
                            to_excel_bytes(get_prereg_ledger(ev["id"]), "Pre-registrations"),
                            file_name=f"{stem}_preregistrations.xlsx", mime=XLSX_MIME,
                            key=f"pre_delete_reg_{ev['id']}", width="stretch")
     typed = st.text_input(f"Type the event name to confirm: {ev['event_name']}",
                           key=f"confirm_delete_{ev['id']}")
     confirmed = typed.strip().casefold() == ev["event_name"].strip().casefold()
-    if st.button("🗑️  Delete this event", type="primary", disabled=not confirmed,
+    if st.button("Delete this event", type="primary", disabled=not confirmed,
                  key=f"delete_event_{ev['id']}"):
         checkins, preregs = delete_event(ev["id"])
         st.session_state.pop("manage_event", None)
@@ -1354,7 +1648,8 @@ def events_tab():
         base = base_url_input()
 
     t_reg, t_chk, t_details, t_flyer, t_delete = st.tabs(
-        ["📝 Pre-registration link", "📲 Check-in QR & poster", "✏️ Edit details", "🖼️ Flyer", "🗑️ Delete"])
+        [":material/link: Pre-registration link", ":material/qr_code_2: Check-in QR & poster",
+         ":material/edit: Edit details", ":material/image: Flyer", ":material/delete: Delete"])
     with t_reg:
         prereg_section(ev, base)
     with t_chk:
@@ -1374,6 +1669,10 @@ def prereg_tab():
         return
     ev = event_picker("Event", "prereg_event", events)
     df = get_prereg_ledger(ev["id"])
+    if not ev["prereg_open"] and df.empty:
+        st.info("Pre-registration is turned off for this event, so it only has day-of check-ins. "
+                "You can turn it on in Events → Pre-registration link.", icon=":material/info:")
+        return
     arrived = int((df["Arrived At"] != "").sum())
     c = st.columns(3)
     c[0].metric("Pre-registered", len(df))
@@ -1395,14 +1694,16 @@ def prereg_tab():
                   f"prereg_{ev['id']}")
 
 
-def attendance_tab():
+def attendance_tab(limited: bool = False):
+    """limited=True is the Usher view: live list and manual check-in, but no
+    contact details, parents' numbers or exports."""
     events = get_events()
     if not events:
         st.info("No events yet.")
         return
     ev = event_picker("Event", "ledger_event", events)
 
-    with st.expander("✍️  Manual check-in (for someone without a phone)"):
+    with st.expander(":material/edit_note: Manual check-in (for someone without a phone)"):
         with st.form(f"manual_checkin_{ev['id']}", clear_on_submit=True):
             phone_raw = st.text_input("Member's registered phone number")
             go = st.form_submit_button("Check them in", type="primary")
@@ -1412,7 +1713,9 @@ def attendance_tab():
             if member_id is None:
                 st.error("No member has that number. New members need to register on the check-in page.")
             elif record_check_in(member_id, ev["id"]):
-                st.success(f"{get_member(member_id)['full_name']} is checked in.")
+                who = get_member(member_id)["full_name"]
+                log_action(f"Manual check-in: {who} for “{ev['event_name']}”")
+                st.success(f"{who} is checked in.")
             else:
                 st.info("They're already checked in for this event.")
 
@@ -1426,10 +1729,13 @@ def attendance_tab():
         c[2].metric("First-timers", int((df["First Visit"] == "Yes").sum()))
         c[3].metric("Under 18", int((df["Under 18"] == "Yes").sum()))
         view = filter_people(df, st.text_input("Search by name or phone", key="ledger_search"))
+        if limited:
+            view = view[["#", "Check-In Time", "Full Name", "Pre-Registered", "First Visit", "Under 18"]]
         st.dataframe(view, width="stretch", hide_index=True)
         st.caption(f"Arrival times are recorded by the server in GMT (Accra time). "
                    f"Last refreshed {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S}.")
-        download_pair(view, f"{safe_filename(ev['event_name'])}_checkins", "Check-ins", f"ledger_{ev['id']}")
+        if not limited:
+            download_pair(view, f"{safe_filename(ev['event_name'])}_checkins", "Check-ins", f"ledger_{ev['id']}")
 
     st.fragment(run_every=LEDGER_REFRESH_SECONDS if auto else None)(render_ledger)()
 
@@ -1494,7 +1800,7 @@ def member_detail(member_id: int):
                     "Use this when someone asks for their data to be deleted.")
         typed = st.text_input(f"Type their phone number to confirm: {m['phone_number']}",
                               key=f"confirm_member_{member_id}")
-        if st.button("🗑️  Remove member", type="primary", key=f"delete_member_{member_id}",
+        if st.button("Remove member", type="primary", key=f"delete_member_{member_id}",
                      disabled=normalize_phone(typed) != m["phone_number"]):
             removed = delete_member(member_id)
             st.session_state.pop("member_pick", None)
@@ -1507,7 +1813,7 @@ def members_tab():
     term = c1.text_input("Search members by name or phone", key="member_search")
     everyone = all_members_export()
     c2.write("")
-    c2.download_button("⬇️  Export all (Excel)", to_excel_bytes(everyone, "Members"),
+    c2.download_button("Export all (Excel)", to_excel_bytes(everyone, "Members"),
                        file_name="Ignite_members.xlsx", width="stretch", mime=XLSX_MIME,
                        disabled=everyone.empty)
 
@@ -1534,9 +1840,10 @@ def backup_tab():
                 "Keep it on your computer or Google Drive.")
     if st.button("Prepare backup file", key="prep_backup"):
         st.session_state.backup_bytes = make_backup_bytes()
+        log_action("Downloaded a full backup")
         st.session_state.backup_name = f"ignite_backup_{datetime.now():%Y-%m-%d_%H%M}.db"
     if st.session_state.get("backup_bytes"):
-        st.download_button("⬇️  Download backup", st.session_state.backup_bytes,
+        st.download_button("Download backup", st.session_state.backup_bytes,
                            file_name=st.session_state.backup_name,
                            mime="application/octet-stream", type="primary")
 
@@ -1549,7 +1856,7 @@ def backup_tab():
     if st.button("Restore backup", type="primary", disabled=not (upload and sure), key="restore_go"):
         try:
             counts = restore_backup(upload.getvalue())
-            for key in ("manage_event", "ledger_event", "prereg_event", "member_pick",
+            for key in ("manage_event", "ledger_event", "prereg_event", "member_pick", "team_pick",
                         "restore_sure", "backup_bytes"):
                 st.session_state.pop(key, None)
             notify(f"Backup restored: {counts['events']} events, {counts['members']} members, "
@@ -1559,14 +1866,155 @@ def backup_tab():
             st.error(str(err))
 
 
+def valid_username(u: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z0-9._-]{3,30}", u))
+
+
+def account_section():
+    user = current_admin()
+    st.markdown("#### Your account")
+    st.caption(f"Signed in as **{user['name']}** (username “{user['username']}”) · {user['role']}")
+    if user["role"] == "Owner":
+        st.caption("This is the main administrator account. Its password is set in Streamlit "
+                   "Secrets (ADMIN_PASSWORD), so change it there.")
+        return
+    with st.form("change_own_password", clear_on_submit=True):
+        c1, c2, c3 = st.columns(3)
+        current = c1.text_input("Current password", type="password")
+        new = c2.text_input("New password", type="password", help="At least 8 characters")
+        again = c3.text_input("Repeat new password", type="password")
+        go = st.form_submit_button("Change my password")
+    if go:
+        me = get_admin(user["id"])
+        if not me or not verify_password(current, me["password_hash"]):
+            st.error("Your current password is incorrect.")
+        elif len(new) < 8:
+            st.error("The new password must be at least 8 characters.")
+        elif new != again:
+            st.error("The two new passwords don't match.")
+        else:
+            update_admin(user["id"], password_hash=hash_password(new))
+            notify("Changed their own password.")
+            st.rerun()
+
+
+def team_tab():
+    user = current_admin()
+    st.markdown("#### Team members")
+    st.caption("Give trusted people their own sign-in instead of sharing the main password. "
+               "Suspend or remove them at any time, and see everything they do in the activity log.")
+    for role, desc in TEAM_ROLES.items():
+        st.markdown(f"- **{role}:** {desc}")
+
+    df = list_admins()
+    with st.expander(":material/person_add: Add a team member", expanded=df.empty):
+        with st.form("add_admin", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            full_name = c1.text_input("Full name")
+            username = c2.text_input("Username", help="3–30 letters, numbers, dots, dashes or underscores")
+            c3, c4 = st.columns(2)
+            password = c3.text_input("Temporary password", type="password",
+                                     help="At least 8 characters. Tell them to change it after signing in.")
+            role = c4.selectbox("Role", list(TEAM_ROLES), format_func=lambda r: f"{r}: {TEAM_ROLES[r]}")
+            add = st.form_submit_button("Add team member", type="primary")
+        if add:
+            problems = []
+            if len(full_name.strip()) < 2:
+                problems.append("Enter their full name.")
+            if not valid_username(username.strip()):
+                problems.append("Usernames need 3–30 letters, numbers, dots, dashes or underscores (no spaces).")
+            elif username.strip().casefold() == owner_username().casefold():
+                problems.append("That username is reserved for the main administrator.")
+            if len(password) < 8:
+                problems.append("The temporary password must be at least 8 characters.")
+            if problems:
+                show_errors(problems)
+            else:
+                try:
+                    create_admin(full_name, username, password, role, user["name"])
+                    notify(f"Added {full_name.strip()} (“{username.strip()}”) to the team as {role}.")
+                    st.rerun()
+                except sqlite3.IntegrityError:
+                    st.error("That username is already taken.")
+
+    if df.empty:
+        st.caption("No team members yet.")
+    else:
+        st.dataframe(df.drop(columns=["id"]), hide_index=True, width="stretch")
+        labels = dict(zip(df["id"], df["Name"] + " (" + df["Username"] + ") · " + df["Role"] + " · " + df["Status"]))
+        ids = list(labels)
+        if st.session_state.get("team_pick") not in ids:
+            st.session_state.pop("team_pick", None)
+        picked = st.selectbox("Manage a team member", ids, format_func=labels.get, index=None,
+                              placeholder="Choose a team member…", key="team_pick")
+        if picked:
+            member = get_admin(int(picked))
+            is_me = member["id"] == user["id"]
+            if is_me:
+                st.info("This is your own account. Another admin can change your role or access.")
+            else:
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    new_role = st.selectbox("Role", list(TEAM_ROLES), index=list(TEAM_ROLES).index(member["role"]),
+                                            key=f"role_{member['id']}")
+                    if st.button("Save role", key=f"save_role_{member['id']}", width="stretch",
+                                 disabled=new_role == member["role"]):
+                        update_admin(member["id"], role=new_role)
+                        notify(f"Changed {member['full_name']}'s role to {new_role}.")
+                        st.rerun()
+                with c2:
+                    st.write("")
+                    st.write("")
+                    label = "Suspend access" if member["is_active"] else "Restore access"
+                    if st.button(label, key=f"active_{member['id']}", width="stretch"):
+                        update_admin(member["id"], is_active=0 if member["is_active"] else 1)
+                        notify(f"{'Suspended' if member['is_active'] else 'Restored'} access for {member['full_name']}.")
+                        st.rerun()
+                with c3:
+                    with st.form(f"reset_pw_{member['id']}", clear_on_submit=True):
+                        temp = st.text_input("New temporary password", type="password")
+                        if st.form_submit_button("Reset password", width="stretch"):
+                            if len(temp) < 8:
+                                st.error("At least 8 characters.")
+                            else:
+                                update_admin(member["id"], password_hash=hash_password(temp))
+                                notify(f"Reset the password for {member['full_name']}.")
+                                st.rerun()
+                with st.expander(f"Remove {member['full_name']} from the team"):
+                    typed = st.text_input(f"Type their username to confirm: {member['username']}",
+                                          key=f"confirm_admin_{member['id']}")
+                    if st.button("Remove from team", type="primary", key=f"remove_admin_{member['id']}",
+                                 disabled=typed.strip().casefold() != member["username"].casefold()):
+                        delete_admin(member["id"])
+                        st.session_state.pop("team_pick", None)
+                        notify(f"Removed {member['full_name']} (“{member['username']}”) from the team.")
+                        st.rerun()
+
+    st.divider()
+    account_section()
+
+    st.divider()
+    st.markdown("#### Activity log")
+    st.caption("Every change made in the admin portal, newest first. Entries can't be edited or deleted here.")
+    log = activity_log()
+    if log.empty:
+        st.caption("Nothing recorded yet.")
+    else:
+        who = st.selectbox("Filter by person", ["Everyone"] + sorted(log["Who"].unique()), key="log_who")
+        view = log if who == "Everyone" else log[log["Who"] == who]
+        st.dataframe(view, hide_index=True, width="stretch", height=320)
+        download_pair(view, "Ignite_activity_log", "Activity log", "activity_log")
+
+
 def admin_page():
     if not admin_is_authenticated():
         admin_login()
         return
 
+    user = current_admin()
     c1, c2 = st.columns([5, 1])
     with c1:
-        brand_header("Admin Portal", compact=True)
+        brand_header(f"Admin Portal · {user['name']} ({user['role']})", compact=True)
     with c2:
         st.write("")
         if st.button("Log out", width="stretch"):
@@ -1576,7 +2024,22 @@ def admin_page():
     if notice:
         st.success(notice)
 
-    tabs = st.tabs(["📊 Overview", "🎟️ Events", "📝 Pre-registrations", "📋 Check-ins", "👥 Members", "💾 Backup"])
+    if user["role"] == "Usher":
+        tabs = st.tabs([":material/fact_check: Check-ins", ":material/person: My account"])
+        with tabs[0]:
+            attendance_tab(limited=True)
+        with tabs[1]:
+            account_section()
+        return
+
+    base = st.session_state.get("base_url_input") or detect_base_url()
+    if base:
+        st.caption(f":material/bookmark: Bookmark your private admin link: {base}/?view=admin "
+                   "(it isn't shown on member pages).")
+
+    tabs = st.tabs([":material/dashboard: Overview", ":material/event: Events", ":material/how_to_reg: Pre-registrations",
+                    ":material/fact_check: Check-ins", ":material/group: Members",
+                    ":material/admin_panel_settings: Team", ":material/backup: Backup"])
     with tabs[0]:
         overview_tab()
     with tabs[1]:
@@ -1588,6 +2051,8 @@ def admin_page():
     with tabs[4]:
         members_tab()
     with tabs[5]:
+        team_tab()
+    with tabs[6]:
         backup_tab()
 
 
@@ -1597,7 +2062,7 @@ def admin_page():
 def main():
     st.session_state.setdefault("form_nonce", 0)
     st.session_state.setdefault("show_admin", False)
-    logged_in = st.session_state.get("admin_expires", 0) > time.time()
+    logged_in = bool(st.session_state.get("admin_user")) and st.session_state.get("admin_expires", 0) > time.time()
     if st.session_state.show_admin or st.query_params.get("view") == "admin" or logged_in:
         mode = "admin"
     elif st.query_params.get("mode") == "register":
