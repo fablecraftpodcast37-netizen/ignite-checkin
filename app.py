@@ -937,6 +937,10 @@ def inject_css(public: bool):
           .ig-done-meta {{margin-top:1.3rem; font-size:.82rem; opacity:.8; padding-top:1rem;
                           border-top:1px solid rgba(255,255,255,.25);}}
           .st-key-ig_scroll {{display:none;}}
+          .st-key-ig_footer_btn .stButton {{display:flex; justify-content:center;}}
+          .st-key-ig_footer_btn button {{min-height:auto !important; padding:.2rem .5rem; color:inherit !important;
+                                         opacity:.5; cursor:default;}}
+          .st-key-ig_footer_btn button p {{font-size:.8rem; font-weight:400;}}
           .ig-footer {{text-align:center; opacity:.55; font-size:.8rem; margin-top:.4rem;}}
         </style>
         """,
@@ -1180,10 +1184,14 @@ def show_event_header(banner, ev: dict):
 
 
 def public_footer():
-    # No admin button here on purpose: admins open the private link
-    # https://<your-app>.streamlit.app/?view=admin (bookmark it).
+    """The © line looks like plain text, but tapping it opens the admin
+    sign-in. It's a quiet back door that doesn't depend on any special link
+    (the ?view=admin link also still works). Sign-in is still required."""
     st.write("")
-    st.markdown(f'<div class="ig-footer">© {datetime.now().year} {APP_NAME}</div>', unsafe_allow_html=True)
+    with st.container(key="ig_footer_btn"):
+        if st.button(f"© {datetime.now().year} {APP_NAME}", key="footer_admin", type="tertiary"):
+            st.session_state.show_admin = True
+            st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -1368,6 +1376,8 @@ def admin_login():
                 st.session_state.locked_until = time.time() + LOCKOUT_SECONDS
                 st.session_state.failed_logins = 0
             st.error("Incorrect username or password.")
+    if st.button("← Back to member page", key="back_to_public", type="tertiary"):
+        leave_admin()
 
 
 def notify(message: str):
