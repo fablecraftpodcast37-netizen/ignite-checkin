@@ -205,12 +205,23 @@ def migrate(conn: sqlite3.Connection):
     conn.executescript(SCHEMA)
 
 
+# A fingerprint of the table layout. When a code update changes the layout,
+# the fingerprint changes too, so the upgrade below runs again automatically,
+# even though Streamlit Cloud applies updates without restarting the app.
+SCHEMA_VERSION = hashlib.sha1((SCHEMA + repr(MIGRATIONS)).encode()).hexdigest()[:12]
+
+
 @st.cache_resource
-def init_db() -> bool:
-    """Create or upgrade the tables once per server process."""
+def _init_db(version: str) -> bool:
     with closing(get_conn()) as conn, conn:
         migrate(conn)
     return True
+
+
+def init_db() -> bool:
+    """Create any missing tables/columns. Safe to run at any time: existing
+    data is never changed or removed."""
+    return _init_db(SCHEMA_VERSION)
 
 
 def query_df(sql: str, params=()) -> pd.DataFrame:
