@@ -131,6 +131,8 @@ CREATE TABLE IF NOT EXISTS events (
     venue       TEXT,
     is_open     INTEGER NOT NULL DEFAULT 1,   -- 1 = day-of check-in is open
     prereg_open INTEGER NOT NULL DEFAULT 1,   -- 1 = event uses pre-registration
+    prereg_deadline TEXT,
+    uses_checkin INTEGER NOT NULL DEFAULT 1,  -- 0 = pre-registration only, no check-in at the venue                     -- 'YYYY-MM-DD HH:MM' Ghana time; pre-registration closes then
     created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     flyer_bytes BLOB                          -- programme flyer, stored as JPEG
 );
@@ -225,6 +227,8 @@ MIGRATIONS = [
     ("members", "sms_opt_in", "INTEGER NOT NULL DEFAULT 0"),
     ("members", "source", "TEXT"),
     ("members", "birth_day", "INTEGER"),
+    ("events", "prereg_deadline", "TEXT"),
+    ("events", "uses_checkin", "INTEGER NOT NULL DEFAULT 1"),
     ("members", "birth_month", "INTEGER"),
 ]
 DATA_VERSION = "intl-phones-1"   # bump when a one-off data upgrade is added
@@ -323,13 +327,13 @@ def set_app_setting(key: str, value: str):
 
 # ----- events ---------------------------------------------------------------
 EVENT_COLUMNS = """e.id, e.event_name, e.event_type, e.event_date, e.venue, e.is_open,
-                   e.prereg_open, e.created_at, e.flyer_bytes IS NOT NULL AS has_flyer,
+                   e.prereg_open, e.prereg_deadline, e.uses_checkin, e.created_at, e.flyer_bytes IS NOT NULL AS has_flyer,
                    (SELECT COUNT(*) FROM attendance a WHERE a.event_id = e.id) AS attendees,
                    (SELECT COUNT(*) FROM pre_registrations p WHERE p.event_id = e.id) AS preregs"""
 
 
 def get_events(open_only: bool = False) -> list[dict]:
-    where = "WHERE e.is_open = 1" if open_only else ""
+    where = "WHERE e.is_open = 1 AND e.uses_checkin = 1" if open_only else ""
     with closing(get_conn()) as conn:
         rows = conn.execute(
             f"""SELECT {EVENT_COLUMNS} FROM events e {where}
@@ -345,26 +349,31 @@ def get_event(event_id: int):
 
 
 def create_event(name, event_type, event_date=None, venue=None, flyer=None,
-                 is_open=True, prereg_open=True) -> int:
+                 is_open=True, prereg_open=True, prereg_deadline=None, uses_checkin=True) -> int:
     with closing(get_conn()) as conn, conn:
         cur = conn.execute(
-            """INSERT INTO events (event_name, event_type, event_date, venue, flyer_bytes, is_open, prereg_open)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO events (event_name, event_type, event_date, venue, flyer_bytes, is_open, prereg_open,
+                                   prereg_deadline, uses_checkin)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (name.strip(), event_type, event_date, (venue or "").strip() or None, flyer,
-             int(is_open), int(prereg_open)),
+             int(is_open), int(prereg_open), prereg_deadline, int(uses_checkin)),
         )
     get_flyer.clear()
     return cur.lastrowid
 
 
-def update_event(event_id, name, event_type, event_date, venue, is_open, prereg_open):
+def update_event(event_id, name, event_type, event_date, venue, is_open, prereg_open, prereg_deadline=None,
+                 uses_checkin=None):
+    """uses_checkin=None leaves that setting as it is."""
     with closing(get_conn()) as conn, conn:
         conn.execute(
             """UPDATE events SET event_name = ?, event_type = ?, event_date = ?, venue = ?,
-                                 is_open = ?, prereg_open = ?
+                                 is_open = ?, prereg_open = ?, prereg_deadline = ?,
+                                 uses_checkin = COALESCE(?, uses_checkin)
                WHERE id = ?""",
             (name.strip(), event_type, event_date, (venue or "").strip() or None,
-             int(is_open), int(prereg_open), event_id),
+             int(is_open), int(prereg_open), prereg_deadline,
+             None if uses_checkin is None else int(uses_checkin), event_id),
         )
 
 
@@ -582,7 +591,7 @@ def overview_stats() -> dict:
     with closing(get_conn()) as conn:
         return dict(conn.execute(
             """SELECT (SELECT COUNT(*) FROM events) AS events,
-                      (SELECT COUNT(*) FROM events WHERE is_open = 1) AS open_events,
+                      (SELECT COUNT(*) FROM events WHERE is_open = 1 AND uses_checkin = 1) AS open_events,
                       (SELECT COUNT(*) FROM members) AS members,
                       (SELECT COUNT(*) FROM members WHERE country IS NOT NULL AND country <> 'Ghana') AS abroad,
                       (SELECT COUNT(*) FROM pre_registrations) AS preregs,
@@ -604,8 +613,12 @@ def events_summary() -> pd.DataFrame:
                     WHERE a.event_id = e.id
                       AND a.id = (SELECT MIN(a2.id) FROM attendance a2 WHERE a2.member_id = a.member_id)
                   ) AS "First-Timers",
-                  CASE WHEN e.prereg_open THEN 'On' ELSE 'Off' END AS "Pre-Registration",
-                  CASE WHEN e.is_open THEN 'Open' ELSE 'Closed' END AS "Check-In"
+                  CASE WHEN NOT e.prereg_open THEN 'Off'
+                       WHEN e.prereg_deadline IS NOT NULL
+                            AND e.prereg_deadline <= strftime('%Y-%m-%d %H:%M', 'now') THEN 'Closed'
+                       ELSE 'On' END AS "Pre-Registration",
+                  CASE WHEN NOT e.uses_checkin THEN 'Not used'
+                       WHEN e.is_open THEN 'Open' ELSE 'Closed' END AS "Check-In"
            FROM events e
            ORDER BY COALESCE(e.event_date, date(e.created_at)) DESC, e.id DESC"""
     )
@@ -834,12 +847,97 @@ def is_valid_email(email: str) -> bool:
 # General helpers
 # ---------------------------------------------------------------------------
 def fmt_date(iso) -> str:
-    if not iso:
+    if not isinstance(iso, str) or not iso:   # empty dates can arrive from pandas as NaN/NA
         return ""
     try:
         return date.fromisoformat(iso).strftime("%a %d %b %Y")
     except ValueError:
         return str(iso)
+
+
+MODE_BOTH, MODE_CHECKIN, MODE_PREREG = "both", "checkin", "prereg"
+MODES = [MODE_BOTH, MODE_CHECKIN, MODE_PREREG]
+MODE_LABELS = {
+    MODE_BOTH: "Pre-registration and check-in at the venue",
+    MODE_CHECKIN: "Check-in at the venue only",
+    MODE_PREREG: "Pre-registration only (no check-in at the venue)",
+}
+
+
+def event_mode(ev: dict) -> str:
+    if not ev.get("uses_checkin", 1):
+        return MODE_PREREG
+    return MODE_BOTH if ev.get("prereg_open") else MODE_CHECKIN
+
+
+def mode_flags(mode: str) -> tuple[bool, bool]:
+    """(prereg_open, uses_checkin) for a mode."""
+    return mode != MODE_CHECKIN, mode != MODE_PREREG
+
+
+def mode_input(key: str, current: str = MODE_BOTH):
+    return st.selectbox("How members take part", MODES, index=MODES.index(current), format_func=MODE_LABELS.get,
+                        key=key, help="Pre-registration only suits programmes where registering is all that's needed. "
+                                      "Those events get no check-in QR code, and when registration closes members are "
+                                      "simply told it has closed.")
+
+
+def parse_deadline(value):
+    try:
+        return datetime.strptime(str(value), "%Y-%m-%d %H:%M") if value else None
+    except ValueError:
+        return None
+
+
+def now_local() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)   # Ghana time is UTC all year
+
+
+def prereg_deadline_passed(ev: dict) -> bool:
+    deadline = parse_deadline(ev.get("prereg_deadline"))
+    return bool(deadline and now_local() >= deadline)
+
+
+def fmt_deadline(value) -> str:
+    """e.g. 'Fri 9 Oct 2026, 6:00 PM'"""
+    d = parse_deadline(value)
+    if not d:
+        return ""
+    hour = d.strftime("%I").lstrip("0") or "12"
+    return f"{d.strftime('%a')} {d.day} {d.strftime('%b %Y')}, {hour}:{d.strftime('%M %p')}"
+
+
+def deadline_inputs(key: str, current=None, label="Pre-registration closes"):
+    """Optional closing date + time. Returns 'YYYY-MM-DD HH:MM' or None."""
+    d = parse_deadline(current)
+    key = f"{key}_{(current or 'none').replace(' ', '_')}"   # fresh widgets whenever the saved value changes
+    c1, c2 = st.columns(2)
+    day = c1.date_input(f"{label} on (optional)", value=d.date() if d else None, format="DD/MM/YYYY",
+                        key=f"{key}_dl_date",
+                        help="Leave empty to keep pre-registration open until you turn it off yourself.")
+    times = [f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 30)] + ["23:59"]
+    current_time = d.strftime("%H:%M") if d else "23:59"
+    if current_time not in times:
+        times = sorted(times + [current_time])
+    at = c2.selectbox("At (Ghana time)", times, index=times.index(current_time), key=f"{key}_dl_time",
+                      format_func=lambda t: fmt_clock(t) + (" (end of day)" if t == "23:59" else ""))
+    return f"{day.isoformat()} {at}" if day else None
+
+
+def fmt_clock(hhmm: str) -> str:
+    t = datetime.strptime(hhmm, "%H:%M")
+    return f"{int(t.strftime('%I'))}:{t.strftime('%M %p')}"
+
+
+def deadline_problem(deadline, event_date):
+    if not deadline or not event_date:
+        return None
+    try:
+        if parse_deadline(deadline).date() > date.fromisoformat(event_date):
+            return "Pre-registration should close on or before the event date."
+    except ValueError:
+        return None
+    return None
 
 
 def event_label(ev: dict) -> str:
@@ -1690,6 +1788,11 @@ def checkin_page():
     if ev is None:
         return
     show_flyer(banner, ev)
+    if not ev.get("uses_checkin", 1):
+        page_heading("Check-in", "No check-in for this programme",
+                     "This programme uses pre-registration only, so there's nothing to do here.")
+        event_ticket(ev)
+        return
     page_heading("Arrival check-in", "Welcome. Let's get you checked in.")
     event_ticket(ev)
     if not ev["is_open"]:
@@ -1722,10 +1825,27 @@ def checkin_page():
 # ---------------------------------------------------------------------------
 # Public page: pre-registration
 # ---------------------------------------------------------------------------
+def prereg_closed_note(ev: dict):
+    ended = f'It ended {esc(fmt_deadline(ev["prereg_deadline"]))}.'
+    extra = (" You can still join us: on the day, scan the QR code at the entrance to check in."
+             if ev.get("uses_checkin", 1) else " Thank you for your interest.")
+    st.markdown(f'<div class="ig-note"><strong>Pre-registration for this programme has closed.</strong> {ended}{extra}'
+                '</div>', unsafe_allow_html=True)
+
+
 def complete_prereg(member_id: int, ev: dict):
+    fresh = get_event(ev["id"]) or ev          # the deadline may have passed while they were typing
+    if not fresh["prereg_open"] or prereg_deadline_passed(fresh):
+        late = ("Registration for this programme closed before your details came in. You're still welcome: "
+                "on the day, scan the QR code at the entrance to check in." if fresh.get("uses_checkin", 1) else
+                "Registration for this programme closed before your details came in, so we couldn't add you.")
+        confirm_and_reset("info", "Pre-registration has closed", late, ev["event_name"], auto_reset=False)
+        return
     if record_pre_registration(member_id, ev["id"]):
-        confirm_and_reset("success", "Your place is reserved",
-                          "On the day, scan the QR code at the entrance and enter your phone number to check in.",
+        done = ("On the day, scan the QR code at the entrance and enter your phone number to check in."
+                if fresh.get("uses_checkin", 1) else
+                "You're on the list, and there's nothing else you need to do. We look forward to seeing you.")
+        confirm_and_reset("success", "Your place is reserved", done,
                           ev["event_name"], auto_reset=False, link=whatsapp_community_link())
     else:
         confirm_and_reset("info", "You're already registered",
@@ -1750,6 +1870,12 @@ def register_page():
         st.markdown('<div class="ig-note">This programme doesn\'t need pre-registration. Just come along on the day '
                     'and scan the QR code at the entrance to check in.</div>', unsafe_allow_html=True)
         return
+    if prereg_deadline_passed(ev):
+        prereg_closed_note(ev)
+        return
+    if ev.get("prereg_deadline"):
+        st.markdown(f'<div class="ig-note"><strong>Pre-registration closes {esc(fmt_deadline(ev["prereg_deadline"]))}'
+                    '</strong> (Ghana time).</div>', unsafe_allow_html=True)
 
     pending = st.session_state.get("reg_pending")
     if pending is None:
@@ -1769,8 +1895,9 @@ def register_page():
                                  "Reserve my place", source="Pre-registration")
         if member_id:
             complete_prereg(member_id, ev)
-    st.markdown('<div class="ig-note">This reserves your place. It isn\'t your check-in: on the day, '
-                'scan the QR code at the entrance to confirm you\'ve arrived.</div>', unsafe_allow_html=True)
+    if ev.get("uses_checkin", 1):
+        st.markdown('<div class="ig-note">This reserves your place. It isn\'t your check-in: on the day, '
+                    'scan the QR code at the entrance to confirm you\'ve arrived.</div>', unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------------------
@@ -2093,48 +2220,87 @@ def create_event_section(has_events: bool):
             ev_date = c3.date_input("Date (optional)", value=None, format="DD/MM/YYYY")
             venue = c4.text_input("Venue (optional)")
             flyer_file = st.file_uploader("Programme flyer (optional, JPEG or PNG)", type=["jpg", "jpeg", "png"])
-            c5, c6 = st.columns(2)
-            prereg_open = c5.toggle("Use pre-registration", value=True,
-                                    help="Turn off for attendance-only events. Members then simply check in on the day.")
-            is_open = c6.toggle("Open day-of check-in", value=True)
+            c5, c6 = st.columns([3, 2], vertical_alignment="bottom")
+            with c5:
+                mode = mode_input("new_event_mode")
+            is_open = c6.toggle("Open day-of check-in", value=True,
+                                help="Ignored for pre-registration-only events.")
+            deadline = deadline_inputs("new_event")
             create = st.form_submit_button("Create event", type="primary")
         if create:
             name = ev_name.strip() or f"{ev_type} {datetime.now():%Y-%m-%d}"
+            prereg_open, uses_checkin = mode_flags(mode)
+            problem = deadline_problem(deadline, ev_date.isoformat() if ev_date else None)
+            if problem:
+                st.error(f"{problem} The event was not created.")
+                return
             try:
                 flyer = prepare_flyer(flyer_file) if flyer_file is not None else None
             except ValueError as err:
                 st.error(f"{err} The event was not created.")
                 return
             new_id = create_event(name, ev_type, ev_date.isoformat() if ev_date else None,
-                                  venue, flyer, is_open, prereg_open)
+                                  venue, flyer, is_open, prereg_open, deadline if prereg_open else None,
+                                  uses_checkin)
             st.session_state.manage_event = new_id
-            notify(f"Created “{name}”. " + ("Its registration link and check-in QR code are ready below."
-                                             if prereg_open else "It's attendance-only; its check-in QR code is ready below."))
+            notify(f"Created “{name}”. " + {
+                MODE_BOTH: "Its registration link and check-in QR code are ready below.",
+                MODE_CHECKIN: "It's attendance-only; its check-in QR code is ready below.",
+                MODE_PREREG: "It's pre-registration only; its registration link is ready below.",
+            }[mode])
             st.rerun()
 
 
 def prereg_section(ev: dict, base):
     c1, c2 = st.columns([3, 1])
-    if ev["prereg_open"]:
-        c1.markdown(f":green[●] **Pre-registration is on** · {ev['preregs']} registered so far")
+    if ev["prereg_open"] and prereg_deadline_passed(ev):
+        c1.markdown(f":red[●] **Pre-registration closed** {fmt_deadline(ev['prereg_deadline'])} · "
+                    f"{ev['preregs']} registered")
+    elif ev["prereg_open"]:
+        closes = f" · closes {fmt_deadline(ev['prereg_deadline'])}" if ev.get("prereg_deadline") else ""
+        c1.markdown(f":green[●] **Pre-registration is on** · {ev['preregs']} registered so far{closes}")
     else:
         c1.markdown(":gray[●] **Pre-registration is off.** Attendance-only: members simply check in on the day.")
-    if c2.button("Turn off pre-registration" if ev["prereg_open"] else "Turn on pre-registration",
-                 key=f"toggle_prereg_{ev['id']}", width="stretch"):
+    prereg_only = not ev.get("uses_checkin", 1)
+    if prereg_only:
+        c2.markdown(f"<div style='text-align:right;color:{MUTED};font-size:.85rem;padding-top:.35rem'>"
+                    "Pre-registration only</div>", unsafe_allow_html=True)
+    elif c2.button("Turn off pre-registration" if ev["prereg_open"] else "Turn on pre-registration",
+                   key=f"toggle_prereg_{ev['id']}", width="stretch"):
         set_event_flag(ev["id"], "prereg_open", not ev["prereg_open"])
         notify(f"Pre-registration turned {'off' if ev['prereg_open'] else 'on'} for “{ev['event_name']}”.")
         st.rerun()
     if not ev["prereg_open"]:
         return
+    with st.form(f"deadline_form_{ev['id']}", border=True):
+        st.markdown("**Closing date and time**")
+        deadline = deadline_inputs(f"prereg_{ev['id']}", ev.get("prereg_deadline"))
+        st.caption("After this time the registration link shows a “registration has closed” message. "
+                   + ("Nothing else happens: this event has no check-in at the venue." if prereg_only
+                      else "Day-of check-in is not affected."))
+        save_dl = st.form_submit_button("Save closing time", type="primary")
+    if save_dl:
+        problem = deadline_problem(deadline, ev.get("event_date"))
+        if problem:
+            st.error(problem)
+        else:
+            update_event(ev["id"], ev["event_name"], ev["event_type"], ev["event_date"], ev["venue"],
+                         ev["is_open"], ev["prereg_open"], deadline)
+            notify(f"Pre-registration for “{ev['event_name']}” now closes {fmt_deadline(deadline)}." if deadline
+                   else f"Removed the closing time for “{ev['event_name']}”.")
+            st.rerun()
     if not base:
         st.warning("Set the app address above to get the registration link.")
         return
     link = register_link(base, ev["id"])
     when = f" on {fmt_date(ev['event_date'])}" if ev["event_date"] else ""
     where = f" at {ev['venue']}" if ev["venue"] else ""
-    message = (f"{ev['event_name']}{when}{where}\n\nReserve your place here: {link}\n\n"
-               f"On the day, simply scan the QR code at the entrance and enter your phone number. "
-               f"See you there.\n{APP_NAME}")
+    closes = (f"Registration closes {fmt_deadline(ev['prereg_deadline'])}.\n\n"
+              if ev.get("prereg_deadline") and not prereg_deadline_passed(ev) else "")
+    on_the_day = ("" if prereg_only else
+                  "On the day, simply scan the QR code at the entrance and enter your phone number. ")
+    message = (f"{ev['event_name']}{when}{where}\n\nReserve your place here: {link}\n\n{closes}"
+               f"{on_the_day}See you there.\n{APP_NAME}")
     left, right = st.columns([3, 2])
     with left:
         st.markdown("**Registration link**")
@@ -2149,6 +2315,11 @@ def prereg_section(ev: dict, base):
 
 
 def checkin_qr_section(ev: dict, base):
+    if not ev.get("uses_checkin", 1):
+        st.info("This event is set to pre-registration only, so it has no check-in QR code. If you need check-in "
+                "at the venue after all, change “How members take part” under **Edit details**.",
+                icon=":material/info:")
+        return
     status = ":green[●] **Check-in is open**" if ev["is_open"] else ":red[●] **Check-in is closed**"
     c1, c2 = st.columns([3, 1])
     c1.markdown(f"{status} · {ev['attendees']} checked in")
@@ -2180,15 +2351,23 @@ def details_section(ev: dict):
         current_date = date.fromisoformat(ev["event_date"]) if ev["event_date"] else None
         ev_date = c3.date_input("Date", value=current_date, format="DD/MM/YYYY")
         venue = c4.text_input("Venue", value=ev["venue"] or "")
-        c5, c6 = st.columns(2)
-        prereg_open = c5.toggle("Use pre-registration", value=bool(ev["prereg_open"]))
-        is_open = c6.toggle("Day-of check-in open", value=bool(ev["is_open"]))
+        c5, c6 = st.columns([3, 2], vertical_alignment="bottom")
+        with c5:
+            mode = mode_input(f"edit_mode_{ev['id']}_{event_mode(ev)}", event_mode(ev))
+        is_open = c6.toggle("Day-of check-in open", value=bool(ev["is_open"]),
+                            help="Ignored for pre-registration-only events.")
+        deadline = deadline_inputs(f"edit_{ev['id']}", ev.get("prereg_deadline"))
         save = st.form_submit_button("Save changes", type="primary")
     if save:
+        problem = deadline_problem(deadline, ev_date.isoformat() if ev_date else None)
         if not name.strip():
             st.error("The event needs a name.")
+        elif problem:
+            st.error(problem)
         else:
-            update_event(ev["id"], name, ev_type, ev_date.isoformat() if ev_date else None, venue, is_open, prereg_open)
+            prereg_open, uses_checkin = mode_flags(mode)
+            update_event(ev["id"], name, ev_type, ev_date.isoformat() if ev_date else None, venue, is_open, prereg_open,
+                         deadline, uses_checkin)
             notify(f"Saved changes to “{name.strip()}”.")
             st.rerun()
 
@@ -2279,6 +2458,16 @@ def prereg_tab():
     if not ev["prereg_open"] and df.empty:
         st.info("Pre-registration is turned off for this event, so it only has day-of check-ins.", icon=":material/info:")
         return
+    if not ev.get("uses_checkin", 1):
+        c1, c2 = st.columns([1, 2])
+        c1.metric("Pre-registered", len(df))
+        if ev.get("prereg_deadline"):
+            c2.markdown(f"**Registration {'closed' if prereg_deadline_passed(ev) else 'closes'}**  \n"
+                        f"{fmt_deadline(ev['prereg_deadline'])}")
+        view = filter_people(df.drop(columns=["Arrived At"]), st.text_input("Search by name or phone", key="prereg_search"))
+        st.dataframe(view, width="stretch", hide_index=True)
+        download_pair(view, f"{safe_filename(ev['event_name'])}_preregistrations", "Pre-registrations", f"prereg_{ev['id']}")
+        return
     arrived = int((df["Arrived At"] != "").sum())
     c = st.columns(3)
     c[0].metric("Pre-registered", len(df))
@@ -2302,6 +2491,10 @@ def attendance_tab(limited: bool = False):
         st.info("No events yet.")
         return
     ev = event_picker("Event", "ledger_event", events)
+    if not ev.get("uses_checkin", 1):
+        st.info("This event is pre-registration only, so it has no check-ins. See the **Pre-registrations** tab.",
+                icon=":material/info:")
+        return
     with st.expander(":material/edit_note: Manual check-in (for someone without a phone)"):
         with st.form(f"manual_checkin_{ev['id']}", clear_on_submit=True):
             raw, country = admin_phone_input(f"manual_{ev['id']}", "Member's phone number")
