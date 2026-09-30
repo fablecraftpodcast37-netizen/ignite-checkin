@@ -29,6 +29,7 @@ Settings (Streamlit Cloud: Settings -> Secrets)
 
 """
 
+import calendar
 import hashlib
 import hmac
 import html
@@ -39,7 +40,7 @@ import sqlite3
 import tempfile
 import time
 from contextlib import closing
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from urllib.parse import quote, urlsplit
 
 import pandas as pd
@@ -145,6 +146,8 @@ CREATE TABLE IF NOT EXISTS members (
     emergency_contact_phone TEXT,
     parent_guardian_phone   TEXT,
     is_minor                INTEGER NOT NULL DEFAULT 0,
+    birth_day               INTEGER,                 -- 1-31, no year kept
+    birth_month             INTEGER,                 -- 1-12
     sms_opt_in              INTEGER NOT NULL DEFAULT 0,  -- legacy column, no longer used
     source                  TEXT,                    -- how they joined: check-in, join link, import...
     consent_at              DATETIME,
@@ -221,6 +224,8 @@ MIGRATIONS = [
     ("members", "country", "TEXT"),
     ("members", "sms_opt_in", "INTEGER NOT NULL DEFAULT 0"),
     ("members", "source", "TEXT"),
+    ("members", "birth_day", "INTEGER"),
+    ("members", "birth_month", "INTEGER"),
 ]
 DATA_VERSION = "intl-phones-1"   # bump when a one-off data upgrade is added
 
@@ -394,7 +399,7 @@ def get_flyer(event_id: int):
 # ----- members ---------------------------------------------------------------
 MEMBER_FIELDS = ("full_name", "phone_number", "whatsapp_number", "email", "country",
                  "emergency_contact_name", "emergency_contact_phone", "parent_guardian_phone",
-                 "is_minor", "source")
+                 "is_minor", "source", "birth_day", "birth_month")
 
 
 def find_member_id(phone: str):
@@ -431,6 +436,11 @@ def update_member(member_id: int, data: dict):
                      {**{c: data[c] for c in cols}, "id": member_id})
 
 
+def set_member_birthday(member_id: int, day: int, month: int):
+    with closing(get_conn()) as conn, conn:
+        conn.execute("UPDATE members SET birth_day = ?, birth_month = ? WHERE id = ?", (day, month, member_id))
+
+
 def delete_member(member_id: int) -> int:
     with closing(get_conn()) as conn, conn:
         removed = conn.execute("DELETE FROM attendance WHERE member_id = ?", (member_id,)).rowcount
@@ -451,6 +461,7 @@ def search_members(term: str = "", country: str = "All countries") -> pd.DataFra
                   m.full_name AS "Full Name",
                   m.phone_number AS "Phone",
                   COALESCE(m.country, '') AS "Country",
+                  m.birth_day, m.birth_month,
                   CASE WHEN m.is_minor THEN 'Yes' ELSE '' END AS "Under 18",
                   (SELECT COUNT(*) FROM attendance a WHERE a.member_id = m.id) AS "Events Attended",
                   (SELECT strftime('%Y-%m-%d', MAX(a.check_in_timestamp))
@@ -474,6 +485,7 @@ def all_members_export() -> pd.DataFrame:
     return query_df(
         """SELECT m.full_name AS "Full Name", m.phone_number AS "Phone",
                   m.whatsapp_number AS "WhatsApp", m.email AS "Email", m.country AS "Country",
+                  m.birth_day, m.birth_month,
                   CASE WHEN m.is_minor THEN 'Yes' ELSE '' END AS "Under 18",
                   m.parent_guardian_phone AS "Parent/Guardian Phone",
                   m.emergency_contact_name AS "Emergency Contact",
@@ -1062,7 +1074,13 @@ def inject_css(public: bool):
 .stApp .stMarkdown .ig-ticket-name, .stApp .stMarkdown .ig-formtitle, .stApp .stMarkdown .ig-serif,
 .stApp .stMarkdown .ig-serif *, .stApp .stMarkdown h1 *, .stApp .stMarkdown h2 *, .stApp .stMarkdown h3 *,
 .stApp .stMarkdown h4 * {{ font-family: 'Cormorant Garamond', Georgia, serif !important; }}
-.stApp [data-testid="stIconMaterial"] {{ font-family: 'Material Symbols Rounded' !important; }}
+.stApp [data-testid="stIconMaterial"], .stApp .stMarkdown [data-testid="stIconMaterial"],
+.stApp .stMarkdown h1 [data-testid="stIconMaterial"], .stApp .stMarkdown h2 [data-testid="stIconMaterial"],
+.stApp .stMarkdown h3 [data-testid="stIconMaterial"], .stApp .stMarkdown h4 [data-testid="stIconMaterial"],
+.stApp .stMarkdown span[role="img"][translate="no"], .stApp .stMarkdown h1 span[role="img"][translate="no"],
+.stApp .stMarkdown h2 span[role="img"][translate="no"], .stApp .stMarkdown h3 span[role="img"][translate="no"],
+.stApp .stMarkdown h4 span[role="img"][translate="no"] {{
+    font-family: 'Material Symbols Rounded' !important; font-weight: 400 !important; }}
 .ig-word, .ig-h1, .ig-ticket-date .d, .ig-ticket-name, .ig-formtitle, [data-testid="stMetricValue"],
 h1, h2, h3, h4, .ig-serif {{ font-variant-numeric: lining-nums; }}
 h1, h2, h3, h4, .ig-serif {{ font-family: 'Cormorant Garamond', Georgia, 'Times New Roman', serif !important;
@@ -1225,10 +1243,190 @@ def event_ticket(ev: dict, public: bool = True):
 FLOW_PREFIXES = ("chk", "reg", "join")
 
 
+# ---------------------------------------------------------------------------
+# Birthdays
+# ---------------------------------------------------------------------------
+MONTHS = list(range(1, 13))
+DEFAULT_BIRTHDAY_MESSAGE = (
+    "Happy birthday, {name}! The whole Ignite Prayer Network family is celebrating you today. "
+    "May this new year draw you closer to God and be full of His favour. Have a blessed day!"
+)
+
+
+def fmt_birthday(day, month) -> str:
+    try:
+        return f"{int(day)} {calendar.month_name[int(month)]}"
+    except (TypeError, ValueError, IndexError):
+        return ""
+
+
+def birthday_problem(day, month, required: bool):
+    if not day and not month:
+        return "Choose the day and month of your birthday." if required else None
+    if not day or not month:
+        return "Choose both the day and the month of your birthday."
+    if int(day) > calendar.monthrange(2024, int(month))[1]:   # 2024 is a leap year, so 29 Feb is allowed
+        return f"{calendar.month_name[int(month)]} doesn't have {int(day)} days."
+    return None
+
+
+def with_birthday_column(df: pd.DataFrame, after: str) -> pd.DataFrame:
+    if df.empty or "birth_day" not in df:
+        return df.drop(columns=["birth_day", "birth_month"], errors="ignore")
+    df = df.copy()
+    bday = [fmt_birthday(d, m) if pd.notna(d) and pd.notna(m) else "" for d, m in zip(df["birth_day"], df["birth_month"])]
+    df = df.drop(columns=["birth_day", "birth_month"])
+    df.insert(list(df.columns).index(after) + 1 if after in df else len(df.columns), "Birthday", bday)
+    return df
+
+
+def birthday_on(day: int, month: int, year: int) -> date:
+    """29 February is celebrated on 28 February in ordinary years."""
+    if month == 2 and day == 29 and not calendar.isleap(year):
+        day = 28
+    return date(year, month, day)
+
+
+def today_local() -> date:
+    return datetime.now(timezone.utc).date()   # Ghana time is UTC all year
+
+
+def members_with_birthdays() -> list[dict]:
+    with closing(get_conn()) as conn:
+        return [dict(r) for r in conn.execute(
+            """SELECT id, full_name, phone_number, whatsapp_number, country, birth_day, birth_month
+               FROM members WHERE birth_day IS NOT NULL AND birth_month IS NOT NULL
+               ORDER BY birth_month, birth_day, full_name COLLATE NOCASE""").fetchall()]
+
+
+def upcoming_birthdays(days: int, start: date | None = None) -> list[dict]:
+    """Birthdays from `start` (today) through the next `days` days, soonest first."""
+    start = start or today_local()
+    out = []
+    for m in members_with_birthdays():
+        nxt = birthday_on(m["birth_day"], m["birth_month"], start.year)
+        if nxt < start:
+            nxt = birthday_on(m["birth_day"], m["birth_month"], start.year + 1)
+        away = (nxt - start).days
+        if away <= days:
+            out.append({**m, "date": nxt, "days_away": away})
+    return sorted(out, key=lambda m: (m["days_away"], m["full_name"].lower()))
+
+
+def birthday_counts() -> tuple[int, int]:
+    with closing(get_conn()) as conn:
+        r = conn.execute("""SELECT SUM(birth_month IS NOT NULL), COUNT(*) FROM members""").fetchone()
+        return int(r[0] or 0), int(r[1] or 0)
+
+
+def birthday_message(name: str) -> str:
+    template = get_app_setting("birthday_message") or DEFAULT_BIRTHDAY_MESSAGE
+    first = (name or "").strip().split(" ")[0] or "friend"
+    return template.replace("{name}", first)
+
+
+def whatsapp_wish_url(member: dict) -> str:
+    number = re.sub(r"\D", "", member.get("whatsapp_number") or member.get("phone_number") or "")
+    return f"https://wa.me/{number}?text={quote(birthday_message(member['full_name']))}"
+
+
+def _ics_text(value: str) -> str:
+    return (value.replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,").replace("\n", "\\n"))
+
+
+def _ics_fold(line: str) -> str:
+    raw = line.encode("utf-8")
+    if len(raw) <= 74:
+        return line
+    parts, current = [], b""
+    for ch in line:
+        b = ch.encode("utf-8")
+        if len(current) + len(b) > 73:
+            parts.append(current.decode("utf-8"))
+            current = b""
+        current += b
+    parts.append(current.decode("utf-8"))
+    return "\r\n ".join(parts)
+
+
+def birthday_calendar_bytes() -> bytes:
+    """An .ics file with every member's birthday as a yearly, all-day event
+    and a reminder at 8am on the day. Phones and Google/Outlook calendars
+    can import it."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Ignite Prayer Network//Birthdays//EN",
+             "CALSCALE:GREGORIAN", "METHOD:PUBLISH", "X-WR-CALNAME:Ignite birthdays"]
+    for m in members_with_birthdays():
+        day, month = int(m["birth_day"]), int(m["birth_month"])
+        if month == 2 and day == 29:
+            start, rule = "20250228", "RRULE:FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=-1"
+        else:
+            start, rule = f"2025{month:02d}{day:02d}", "RRULE:FREQ=YEARLY"
+        end = (date(int(start[:4]), int(start[4:6]), int(start[6:])) + timedelta(days=1)).strftime("%Y%m%d")
+        phone = fmt_phone(m.get("whatsapp_number") or m["phone_number"])
+        lines += [
+            "BEGIN:VEVENT",
+            f"UID:ignite-member-{m['id']}-birthday@igniteprayernetwork",
+            f"DTSTAMP:{stamp}",
+            f"DTSTART;VALUE=DATE:{start}",
+            f"DTEND;VALUE=DATE:{end}",
+            rule,
+            f"SUMMARY:{_ics_text(m['full_name'] + chr(39) + 's birthday')}",
+            f"DESCRIPTION:{_ics_text('Ignite member. WhatsApp: ' + phone + '. Send wishes: ' + whatsapp_wish_url(m))}",
+            "TRANSP:TRANSPARENT",
+            "BEGIN:VALARM", "ACTION:DISPLAY",
+            f"DESCRIPTION:{_ics_text(m['full_name'] + chr(39) + 's birthday today')}",
+            "TRIGGER:PT8H", "END:VALARM",
+            "END:VEVENT",
+        ]
+    lines.append("END:VCALENDAR")
+    return ("\r\n".join(_ics_fold(l) for l in lines) + "\r\n").encode("utf-8")
+
+
+_MONTH_LOOKUP = {name.lower()[:3]: i for i, name in enumerate(calendar.month_name) if name}
+
+
+def parse_birthday(text):
+    """Read a birthday from an imported cell: 12/03, 12/03/1990, 1990-03-12,
+    12 March, March 12, 12th Mar 1990. Day comes before month in numbers."""
+    t = str(text or "").strip().lower()
+    if not t or t == "nan":
+        return None
+    m = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})", t)
+    if m:
+        day, month = int(m.group(3)), int(m.group(2))
+    else:
+        m = re.match(r"^(\d{1,2})[/.\-](\d{1,2})(?:[/.\-]\d{2,4})?$", t)
+        if m:
+            day, month = int(m.group(1)), int(m.group(2))
+        else:
+            words = re.findall(r"[a-z]+|\d+", t)
+            month = next((_MONTH_LOOKUP.get(w[:3]) for w in words if w[:3] in _MONTH_LOOKUP), None)
+            nums = [int(w) for w in words if w.isdigit() and int(w) <= 31]
+            if not month or not nums:
+                return None
+            day = nums[0]
+    if not 1 <= month <= 12 or birthday_problem(day, month, True):
+        return None
+    return day, month
+
+
+def birthday_inputs(key_prefix: str, required: bool, day=None, month=None):
+    """Day and month pickers. Returns (day, month); either may be None."""
+    c1, c2 = st.columns(2)
+    star = " *" if required else ""
+    d = c1.selectbox(f"Day{star}", list(range(1, 32)), index=(int(day) - 1) if day else None,
+                     placeholder="Day", key=f"{key_prefix}_bd")
+    m = c2.selectbox(f"Month{star}", MONTHS, index=(int(month) - 1) if month else None,
+                     format_func=lambda i: calendar.month_name[i], placeholder="Month", key=f"{key_prefix}_bm")
+    return d, m
+
+
 def reset_flow_state():
     for p in FLOW_PREFIXES:
         st.session_state.pop(f"{p}_pending", None)
         st.session_state.pop(f"{p}_known", None)
+        st.session_state.pop(f"{p}_bday", None)
 
 
 def confirm_and_reset(kind: str, title: str, message: str, context: str,
@@ -1352,6 +1550,12 @@ def details_step(prefix: str, pending: dict, title: str, note: str, button: str,
         whatsapp_raw = st.text_input("WhatsApp number", placeholder="Leave blank if it's the number above",
                                      key=k("wa"))
 
+        need_bday = source == "Join link"
+        st.markdown(f'<div class="ig-section">Your birthday{"" if need_bday else " (optional)"}</div>',
+                    unsafe_allow_html=True)
+        b_day, b_month = birthday_inputs(k("birthday"), need_bday)
+        st.caption("Just the day and month, so the family can celebrate with you.")
+
         st.markdown('<div class="ig-section">Emergency contact</div>', unsafe_allow_html=True)
         c3, c4 = st.columns(2)
         ec_name = c3.text_input("Name *", placeholder="Who should we call?", key=k("ecn"))
@@ -1383,6 +1587,9 @@ def details_step(prefix: str, pending: dict, title: str, note: str, button: str,
         errors.append("The email address doesn't look right.")
     if whatsapp_raw.strip() and phone_problem(whatsapp):
         errors.append("The WhatsApp number doesn't look right.")
+    bday_error = birthday_problem(b_day, b_month, need_bday)
+    if bday_error:
+        errors.append(bday_error)
     if not ec_name.strip():
         errors.append("Enter the name of your emergency contact.")
     if not ec_raw.strip() or phone_problem(ec_phone):
@@ -1399,13 +1606,15 @@ def details_step(prefix: str, pending: dict, title: str, note: str, button: str,
 
     existing = find_member_id(pending["phone"])   # someone may have registered meanwhile
     if existing:
+        if b_day and b_month and not (get_member(existing) or {}).get("birth_month"):
+            set_member_birthday(existing, b_day, b_month)
         return existing
     return create_member({
         "full_name": full_name.strip(), "phone_number": pending["phone"], "whatsapp_number": whatsapp,
         "email": email.strip() or None, "country": lives_in if lives_in != "Other country" else None,
         "emergency_contact_name": ec_name.strip(), "emergency_contact_phone": ec_phone,
         "parent_guardian_phone": parent or None, "is_minor": int(is_minor),
-        "source": source,
+        "source": source, "birth_day": b_day, "birth_month": b_month,
     })
 
 
@@ -1567,6 +1776,33 @@ def register_page():
 # ---------------------------------------------------------------------------
 # Public page: member registration (shared in the WhatsApp group)
 # ---------------------------------------------------------------------------
+def join_birthday_step(member_id: int, link):
+    """For people already on the list who haven't given a birthday yet.
+    Their name is not shown, so a typed-in number reveals nothing."""
+    nonce = st.session_state.form_nonce
+    c1, c2 = st.columns([3, 2])
+    c1.markdown('<div class="ig-step">Almost done</div>', unsafe_allow_html=True)
+    if c2.button("Use a different number", key=f"join_bday_change_{nonce}", type="tertiary"):
+        st.session_state.pop("join_bday", None)
+        st.rerun()
+    with st.form(key=f"join_bday_form_{nonce}"):
+        st.markdown('<div class="ig-formtitle">Add your birthday</div><div class="ig-formnote">This number is '
+                    "already on our member list. Tell us your birthday so the family can celebrate with you."
+                    "</div>", unsafe_allow_html=True)
+        b_day, b_month = birthday_inputs(f"join_bday_{nonce}", True)
+        go = st.form_submit_button("Save my birthday", type="primary", width="stretch")
+    if not go:
+        return
+    problem = birthday_problem(b_day, b_month, True)
+    if problem:
+        show_errors([problem])
+        return
+    set_member_birthday(member_id, b_day, b_month)
+    confirm_and_reset("success", "Thank you",
+                      "Your birthday is saved. You're all set on the Ignite member list.",
+                      "Membership", auto_reset=False, link=link)
+
+
 def join_page():
     if show_confirmation():
         return
@@ -1576,6 +1812,7 @@ def join_page():
     link = whatsapp_community_link()
     known = st.session_state.get("join_known")
     pending = st.session_state.get("join_pending")
+    bday_for = st.session_state.get("join_bday")
 
     if known:
         # Number already registered. Don't reveal whose it is.
@@ -1584,12 +1821,18 @@ def join_page():
                           "This number is already on our member list, so there's nothing more to do. Thank you.",
                           "Membership", auto_reset=False, link=link)
 
+    if bday_for:
+        join_birthday_step(bday_for, link)
+        return
+
     if pending is None:
         found = phone_step("join", "Start with your phone number",
                            "Members abroad: choose your country first. We'll ask for a few details next.", "Continue")
         if found:
             member_id = find_member_id(found["phone"])
-            if member_id:
+            if member_id and not (get_member(member_id) or {}).get("birth_month"):
+                st.session_state.join_bday = member_id
+            elif member_id:
                 st.session_state.join_known = member_id
             else:
                 st.session_state.join_pending = found
@@ -1737,7 +1980,82 @@ def admin_phone_input(key: str, label: str = "Phone number", default_country: st
 # ---------------------------------------------------------------------------
 # Admin: overview
 # ---------------------------------------------------------------------------
+def birthday_row(member: dict, when: str):
+    left, right = st.columns([3, 2], vertical_alignment="center")
+    where = f" · {member['country']}" if member.get("country") else ""
+    left.markdown(f"**{esc(member['full_name'])}**  \n"
+                  f"<span style='color:{MUTED};font-size:.88rem'>{when} · {esc(fmt_phone(member.get('whatsapp_number') or member['phone_number']))}{esc(where)}</span>",
+                  unsafe_allow_html=True)
+    right.link_button("Send wishes on WhatsApp", whatsapp_wish_url(member), icon=":material/cake:", width="stretch")
+
+
+def birthdays_today_panel():
+    soon = upcoming_birthdays(7)
+    today = [m for m in soon if m["days_away"] == 0]
+    later = [m for m in soon if m["days_away"] > 0]
+    if not soon:
+        return
+    with st.container(border=True):
+        if today:
+            st.markdown(f"#### :material/cake: Birthday{'s' if len(today) > 1 else ''} today")
+            for m in today:
+                birthday_row(m, "Today")
+        else:
+            st.markdown("#### :material/cake: Birthdays this week")
+        if later:
+            if today:
+                st.markdown("**Coming up this week**")
+            for m in later:
+                when = "Tomorrow" if m["days_away"] == 1 else m["date"].strftime("%A %d %B").replace(" 0", " ")
+                birthday_row(m, when)
+
+
+def birthdays_section():
+    have, total = birthday_counts()
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Birthdays on file", have)
+    c2.metric("Still missing", total - have)
+    c3.metric("This month", sum(1 for m in members_with_birthdays() if m["birth_month"] == today_local().month))
+
+    st.markdown("#### Get a reminder on your phone")
+    st.markdown("Download this calendar file and open it on your phone (or import it into Google Calendar or "
+                "Outlook). Every member's birthday shows up as a yearly event with a reminder at 8am on the day, "
+                "and the event has a link to send wishes on WhatsApp. Download it again every few weeks to pick "
+                "up new members.")
+    st.download_button("Download birthday calendar (.ics)", birthday_calendar_bytes(),
+                       file_name="Ignite_birthdays.ics", mime="text/calendar", type="primary",
+                       icon=":material/event:", disabled=have == 0, key="bday_ics")
+    st.caption("The file contains names and phone numbers, so keep it to the team.")
+
+    st.markdown("#### Birthdays by month")
+    month = st.selectbox("Month", MONTHS, index=today_local().month - 1,
+                         format_func=lambda i: calendar.month_name[i], key="bday_month")
+    rows = [m for m in members_with_birthdays() if m["birth_month"] == month]
+    if not rows:
+        st.caption(f"No birthdays recorded for {calendar.month_name[month]} yet.")
+    else:
+        for m in rows:
+            birthday_row(m, fmt_birthday(m["birth_day"], m["birth_month"]))
+
+    st.markdown("#### Birthday message")
+    with st.form("bday_msg_form"):
+        text = st.text_area("Message that opens in WhatsApp", value=get_app_setting("birthday_message") or DEFAULT_BIRTHDAY_MESSAGE,
+                            height=110, help="{name} is replaced with the member's first name.")
+        c1, c2 = st.columns(2)
+        saved = c1.form_submit_button("Save message", type="primary")
+        reset = c2.form_submit_button("Use the default message")
+    if saved or reset:
+        set_app_setting("birthday_message", "" if reset else text.strip())
+        notify("Birthday message updated.")
+        st.rerun()
+
+    if total - have:
+        st.info("To collect birthdays from people already on the list, post the membership link again. Anyone who "
+                "is already registered only gets asked for their birthday.", icon=":material/lightbulb:")
+
+
 def overview_tab():
+    birthdays_today_panel()
     s = overview_stats()
     c = st.columns(6)
     c[0].metric("Members", s["members"])
@@ -2030,7 +2348,9 @@ def member_detail(member_id: int):
     history = member_history(member_id)
     attended = int((history["Checked In"] != "").sum()) if not history.empty else 0
     st.markdown(f"#### {esc(m['full_name'])}")
-    st.caption(f"{fmt_phone(m['phone_number'])} · {m.get('country') or 'Country not recorded'} · joined "
+    bday_text = fmt_birthday(m.get("birth_day"), m.get("birth_month"))
+    st.caption(f"{fmt_phone(m['phone_number'])} · {m.get('country') or 'Country not recorded'} · "
+               + (f"birthday {bday_text} · " if bday_text else "") + "joined "
                f"{m['created_at'][:10]} · attended {attended} event(s)"
                + (" · under 18" if m["is_minor"] else ""))
     t_hist, t_edit, t_delete = st.tabs(["History", "Edit details", "Remove member"])
@@ -2053,6 +2373,8 @@ def member_detail(member_id: int):
             c5, c6 = st.columns(2)
             ec_name = c5.text_input("Emergency contact name", value=m["emergency_contact_name"] or "")
             ec_phone = c6.text_input("Emergency contact phone", value=m["emergency_contact_phone"] or "")
+            st.markdown("**Birthday**")
+            b_day, b_month = birthday_inputs(f"edit_member_{member_id}", False, m.get("birth_day"), m.get("birth_month"))
             is_minor = st.checkbox("Under 18", value=bool(m["is_minor"]))
             parent = st.text_input("Parent/guardian phone", value=m["parent_guardian_phone"] or "")
             save = st.form_submit_button("Save changes", type="primary")
@@ -2066,8 +2388,10 @@ def member_detail(member_id: int):
                 "emergency_contact_phone": to_intl(ec_phone, num_country) if ec_phone.strip() else None,
                 "parent_guardian_phone": to_intl(parent, num_country) if parent.strip() else None,
                 "is_minor": int(is_minor),
+                "birth_day": b_day if (b_day and b_month) else None,
+                "birth_month": b_month if (b_day and b_month) else None,
             }
-            problem = phone_problem(data["phone_number"])
+            problem = phone_problem(data["phone_number"]) or birthday_problem(b_day, b_month, False)
             if len(data["full_name"]) < 2 or problem:
                 st.error(problem or "A name is required.")
             elif data["email"] and not is_valid_email(data["email"]):
@@ -2082,7 +2406,7 @@ def member_detail(member_id: int):
                 except sqlite3.IntegrityError:
                     st.error("Another member already uses that phone number.")
     with t_delete:
-        st.markdown("Removes this person, their check-ins, pre-registrations and text history. "
+        st.markdown("Removes this person, their check-ins and pre-registrations. "
                     "Use this when someone asks for their data to be deleted.")
         typed = st.text_input(f"Type their phone number to confirm: {m['phone_number']}", key=f"confirm_member_{member_id}")
         if st.button("Remove member", type="primary", key=f"delete_member_{member_id}",
@@ -2120,14 +2444,14 @@ def directory_section():
     c1, c2 = st.columns([2, 1])
     term = c1.text_input("Search by name or phone", key="member_search")
     country = c2.selectbox("Country", ["All countries"] + member_countries(), key="member_country")
-    df = search_members(term, country)
+    df = with_birthday_column(search_members(term, country), after="Country")
     if df.empty:
         st.caption("No members match." if (term or country != "All countries")
                    else "No members yet. Share the membership link or import your existing list.")
         return
     st.caption(f"{len(df)} member(s)")
     st.dataframe(df.drop(columns=["id"]), hide_index=True, width="stretch", height=320)
-    everyone = all_members_export()
+    everyone = with_birthday_column(all_members_export(), after="Country")
     st.download_button("Export the full member list (Excel)", to_excel_bytes(everyone, "Members"),
                        file_name="Ignite_members.xlsx", mime=XLSX_MIME, key="export_members")
     labels = dict(zip(df["id"], df["Full Name"] + " · " + df["Phone"]))
@@ -2158,6 +2482,7 @@ def membership_link_section():
     link = join_link(base)
     message = (f"Dear Ignite family,\n\nPlease take a minute to register on our member list, "
                f"wherever you are in the world:\n{link}\n\n"
+               f"Already registered? Open the link anyway and enter your number so you can add your birthday.\n\n"
                f"You'll also check in faster at our gatherings.\n{APP_NAME}")
     left, right = st.columns([3, 2])
     with left:
@@ -2199,7 +2524,8 @@ def import_section():
                 "so they're recognised the first time they check in.")
     upload = st.file_uploader("Excel or CSV file", type=["xlsx", "csv"], key="import_file")
     if not upload:
-        st.caption("Your file needs at least a name column and a phone number column. Other columns are optional.")
+        st.caption("Your file needs at least a name column and a phone number column. Email and birthday "
+                   "columns are optional. Birthdays can be written like 12/03, 12 March or 1990-03-12.")
         return
     try:
         raw = pd.read_csv(upload, dtype=str) if upload.name.lower().endswith(".csv") else pd.read_excel(upload, dtype=str)
@@ -2216,13 +2542,18 @@ def import_section():
     phone_col = c2.selectbox("Column with phone numbers", cols, index=_guess(cols, ["phone", "mobile", "number", "tel"]))
     email_col = c3.selectbox("Column with emails", [IMPORT_NONE] + cols,
                              index=(_guess(cols, ["mail"]) + 1) if any("mail" in str(c).lower() for c in cols) else 0)
-    default_country = st.selectbox("Numbers without a + are from", COUNTRY_NAMES[:-1], format_func=country_label)
+    c4, c5 = st.columns(2)
+    has_bday = any(w in str(c).lower() for c in cols for w in ("birth", "dob"))
+    bday_col = c4.selectbox("Column with birthdays", [IMPORT_NONE] + cols,
+                            index=(_guess(cols, ["birth", "dob"]) + 1) if has_bday else 0)
+    default_country = c5.selectbox("Numbers without a + are from", COUNTRY_NAMES[:-1], format_func=country_label)
 
     rows, seen = [], set()
     for _, r in raw.iterrows():
         name = str(r.get(name_col) or "").strip()
         phone = to_intl(str(r.get(phone_col) or ""), default_country)
         email = str(r.get(email_col) or "").strip() if email_col != IMPORT_NONE else ""
+        bday = parse_birthday(r.get(bday_col)) if bday_col != IMPORT_NONE else None
         if not name or name.lower() == "nan":
             status = "Skipped: no name"
         elif phone_problem(phone):
@@ -2232,10 +2563,11 @@ def import_section():
         else:
             status = "Will be added"
         seen.add(phone)
-        rows.append({"Name": name, "Phone": phone, "Email": email if email.lower() != "nan" else "", "Result": status})
+        rows.append({"Name": name, "Phone": phone, "Email": email if email.lower() != "nan" else "",
+                     "Birthday": fmt_birthday(*bday) if bday else "", "_bday": bday, "Result": status})
     preview = pd.DataFrame(rows)
     new = preview[preview["Result"] == "Will be added"]
-    st.dataframe(preview, hide_index=True, width="stretch", height=280)
+    st.dataframe(preview.drop(columns=["_bday"]), hide_index=True, width="stretch", height=280)
     st.caption(f"{len(new)} new · {int((preview['Result'] == 'Already on the list').sum())} already on the list · "
                f"{int(preview['Result'].str.startswith('Skipped').sum())} skipped")
     if st.button(f"Import {len(new)} member(s)", type="primary", disabled=new.empty, key="do_import"):
@@ -2244,7 +2576,9 @@ def import_section():
             try:
                 create_member({"full_name": r["Name"], "phone_number": r["Phone"], "whatsapp_number": r["Phone"],
                                "email": r["Email"] or None, "country": country_from_number(r["Phone"]),
-                               "source": "Imported"})
+                               "source": "Imported",
+                               "birth_day": r["_bday"][0] if r["_bday"] else None,
+                               "birth_month": r["_bday"][1] if r["_bday"] else None})
                 added += 1
             except sqlite3.IntegrityError:
                 pass
@@ -2254,10 +2588,13 @@ def import_section():
 
 
 def members_tab():
-    t_dir, t_link, t_import = st.tabs([":material/groups: Directory", ":material/share: Membership link",
-                                       ":material/upload_file: Import existing members"])
+    t_dir, t_bday, t_link, t_import = st.tabs([":material/groups: Directory", ":material/cake: Birthdays",
+                                               ":material/share: Membership link",
+                                               ":material/upload_file: Import existing members"])
     with t_dir:
         directory_section()
+    with t_bday:
+        birthdays_section()
     with t_link:
         membership_link_section()
     with t_import:
