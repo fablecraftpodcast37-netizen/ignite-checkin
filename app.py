@@ -3525,6 +3525,10 @@ def import_section():
         st.error("That file couldn't be read. Save it as .xlsx or .csv and try again.")
         return
     raw = raw.dropna(how="all")
+            # Force all blank or broken spots to become safe text instead of float numbers
+        raw = raw.fillna("")
+        for col in raw.columns:
+            raw[col] = raw[col].astype(str).str.strip()
     cols = list(raw.columns)
     if not cols:
         st.error("The file looks empty.")
