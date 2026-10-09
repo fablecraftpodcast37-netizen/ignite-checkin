@@ -700,62 +700,28 @@ def mc_registrations(session_id=None, status=None) -> pd.DataFrame:
 
 
 # ----- Daily Google Meet prayer room -----------------------------------------------
+PRAYER_DAY_STARTS_HOUR = 6   # a prayer that runs past midnight still belongs to the evening it started
+
+
+def prayer_day(moment: datetime | None = None) -> date:
+    """The prayer 'day'. Anything before 6 am counts as the night before,
+    so a meeting from 10 pm to 1 am is one prayer day."""
+    moment = moment or datetime.now(timezone.utc)
+    return (moment - timedelta(hours=PRAYER_DAY_STARTS_HOUR)).date()
+
+
 def meet_log(display_name: str, phone: str):
     with closing(get_conn()) as conn, conn:
         conn.execute(
             """INSERT INTO google_meet_tracker (member_display_name, phone_number, tracking_date)
-               VALUES (?, ?, date('now'))""", (display_name.strip(), phone))
+               VALUES (?, ?, ?)""", (display_name.strip(), phone, prayer_day().isoformat()))
 
 
-def meet_attendance(day: str) -> pd.DataFrame:
-    return query_df(
-        """SELECT t.member_display_name AS "Meet Display Name", t.phone_number AS "Phone",
-                  COALESCE(m.full_name, '') AS "Member On File",
-                  strftime('%H:%M:%S', MIN(t.join_time)) AS "First Joined (GMT)",
-                  COUNT(*) AS "Times Joined"
-           FROM google_meet_tracker t LEFT JOIN members m ON m.phone_number = t.phone_number
-           WHERE t.tracking_date = ?
-           GROUP BY t.phone_number ORDER BY MIN(t.join_time)""", (day,))
-
-
-MEET_DEFAULTS = {"meet_code_minutes": "10", "meet_grace": "5", "meet_min_pct": "75",
-                 "meet_start": "", "meet_end": ""}
+MEET_DEFAULTS = {"meet_grace": "10", "meet_min_pct": "50"}
 
 
 def meet_setting(key: str) -> str:
     return get_app_setting(key, MEET_DEFAULTS.get(key, ""))
-
-
-def meet_code_state() -> dict:
-    """The closing code members type at the end of prayer to show they stayed."""
-    code = get_app_setting("meet_code")
-    day = get_app_setting("meet_code_date")
-    try:
-        until = float(get_app_setting("meet_code_until", "0") or 0)
-    except ValueError:
-        until = 0.0
-    active = bool(code) and day == today_local().isoformat() and until > time.time()
-    return {"code": code, "date": day, "until": until, "active": active}
-
-
-def meet_open_code(minutes: int) -> str:
-    code = f"{secrets.randbelow(9000) + 1000}"
-    set_app_setting("meet_code", code)
-    set_app_setting("meet_code_date", today_local().isoformat())
-    set_app_setting("meet_code_until", str(time.time() + int(minutes) * 60))
-    return code
-
-
-def meet_close_code():
-    set_app_setting("meet_code_until", "0")
-
-
-def meet_joined_name(phone: str, day: str):
-    with closing(get_conn()) as conn:
-        row = conn.execute("""SELECT member_display_name FROM google_meet_tracker
-                              WHERE phone_number = ? AND tracking_date = ? ORDER BY join_time LIMIT 1""",
-                           (phone, day)).fetchone()
-        return row["member_display_name"] if row else None
 
 
 def meet_record_stay(day: str, phone, name: str, method: str, stayed: bool = True, minutes=None,
@@ -775,9 +741,27 @@ def meet_remove_stay(day: str, phone: str, method: str):
                      (day, method, phone))
 
 
+def meet_report_exists(day: str) -> bool:
+    with closing(get_conn()) as conn:
+        return bool(conn.execute("SELECT 1 FROM meet_stays WHERE tracking_date = ? AND method = 'report' LIMIT 1",
+                                 (day,)).fetchone())
+
+
 def _norm_name(text) -> str:
     text = re.sub(r"[^a-z0-9 ]", " ", str(text or "").casefold())
     return " ".join(text.split())
+
+
+def _name_keys(text) -> set:
+    """'Ama Serwaa Mensah' matches 'Mensah Ama Serwaa' and 'ama  serwaa mensah'."""
+    n = _norm_name(text)
+    if not n:
+        return set()
+    parts = n.split()
+    keys = {n, " ".join(sorted(parts))}
+    if len(parts) >= 2:
+        keys.add(" ".join(sorted([parts[0], parts[-1]])))   # first + last name only
+    return keys
 
 
 def parse_duration_minutes(value):
@@ -826,7 +810,28 @@ def _read_report_table(upload) -> pd.DataFrame:
     return table.dropna(how="all")
 
 
-def parse_attendance_report(table: pd.DataFrame, grace: int, min_pct: int, meeting_minutes=None) -> pd.DataFrame:
+def _parse_clock(value):
+    """A report time like '9:58 PM', '21:58:10' or a full date-time."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return pd.NaT, False
+    if isinstance(value, datetime):
+        return pd.Timestamp(value), True
+    text = str(value).strip()
+    if not text or text.lower() == "nan":
+        return pd.NaT, False
+    has_date = bool(re.search(r"\d{1,4}[-/]\d{1,2}[-/]\d{1,4}|[A-Za-z]{3,}\s+\d{1,2},?\s+\d{4}", text))
+    ts = pd.to_datetime(text, errors="coerce")
+    if pd.isna(ts) and not has_date:
+        ts = pd.to_datetime("2000-01-01 " + text, errors="coerce")
+    elif not pd.isna(ts) and not has_date:
+        ts = pd.Timestamp.combine(date(2000, 1, 1), ts.time())
+    return ts, has_date
+
+
+def parse_attendance_report(table: pd.DataFrame, grace: int, min_pct: int) -> pd.DataFrame:
+    """Work out, from Google's report, how long each person was in the call and
+    whether they were still there when the call ended. The end is simply the
+    last time anyone left, so it works whatever time the prayer closes."""
     cols = {c.lower(): c for c in table.columns}
     pick = lambda *words: next((cols[c] for c in cols if any(w in c for w in words)), None)
     first, last = pick("first"), pick("surname", "last name", "last")
@@ -835,25 +840,31 @@ def parse_attendance_report(table: pd.DataFrame, grace: int, min_pct: int, meeti
     join_c, exit_c = pick("joined", "join time", "join"), pick("exited", "exit", "left", "leave")
     if not (first or full) or not dur_c:
         raise ValueError("The report needs a name column and a Duration column.")
+    clean = lambda v: "" if v is None or (isinstance(v, float) and pd.isna(v)) else str(v).strip()
     rows = []
     for _, r in table.iterrows():
-        clean = lambda v: "" if v is None or (isinstance(v, float) and pd.isna(v)) else str(v).strip()
         name = (f"{clean(r.get(first))} {clean(r.get(last))}" if first else clean(r.get(full))).strip()
         if not name:
             continue
-        rows.append({"Name": " ".join(name.split()),
-                     "Email": clean(r.get(email_c)) if email_c else "",
-                     "Minutes": parse_duration_minutes(r.get(dur_c)),
-                     "_join": pd.to_datetime(str(r.get(join_c)), errors="coerce") if join_c else pd.NaT,
-                     "_exit": pd.to_datetime(str(r.get(exit_c)), errors="coerce") if exit_c else pd.NaT})
+        j, jd = _parse_clock(r.get(join_c)) if join_c else (pd.NaT, False)
+        e, ed = _parse_clock(r.get(exit_c)) if exit_c else (pd.NaT, False)
+        rows.append({"Name": " ".join(name.split()), "Email": clean(r.get(email_c)) if email_c else "",
+                     "Minutes": parse_duration_minutes(r.get(dur_c)), "_join": j, "_exit": e,
+                     "_dated": jd or ed})
     df = pd.DataFrame(rows)
     if df.empty:
         raise ValueError("No participants found in that file.")
-    exits = df["_exit"].dropna()
-    joins = df["_join"].dropna()
-    if meeting_minutes:
-        span = float(meeting_minutes)
-    elif len(exits) and len(joins):
+    # Times without a date: a prayer from 9 pm to 1 am crosses midnight. Move the
+    # small-hours times onto the next day so the order is right.
+    if not df["_dated"].any():
+        stamps = pd.concat([df["_join"], df["_exit"]]).dropna()
+        if len(stamps) and (stamps.dt.hour >= 15).any() and (stamps.dt.hour < 10).any():
+            for c in ("_join", "_exit"):
+                df[c] = df[c].map(lambda t: t + pd.Timedelta(days=1) if not pd.isna(t) and t.hour < 10 else t)
+        bad = (~df["_join"].isna()) & (~df["_exit"].isna()) & (df["_exit"] < df["_join"])
+        df.loc[bad, "_exit"] = df.loc[bad, "_exit"] + pd.Timedelta(days=1)
+    exits, joins = df["_exit"].dropna(), df["_join"].dropna()
+    if len(exits) and len(joins):
         span = (exits.max() - joins.min()).total_seconds() / 60
     else:
         span = float(df["Minutes"].max() or 0)
@@ -862,40 +873,69 @@ def parse_attendance_report(table: pd.DataFrame, grace: int, min_pct: int, meeti
     verdicts = []
     for _, r in df.iterrows():
         mins = r["Minutes"]
-        long_enough = mins is not None and not pd.isna(mins) and mins >= need
-        to_end = end is None or pd.isna(r["_exit"]) or (end - r["_exit"]).total_seconds() / 60 <= grace
+        has_mins = mins is not None and not pd.isna(mins)
+        long_enough = has_mins and mins >= need
+        left_before = None if end is None or pd.isna(r["_exit"]) else (end - r["_exit"]).total_seconds() / 60
+        to_end = left_before is None or left_before <= grace
         stayed = bool(long_enough and to_end)
         if stayed:
             why = "Stayed to the end"
-        elif not long_enough:
-            why = f"Left early (in the call {mins:.0f} of {span:.0f} min)" if mins is not None and not pd.isna(mins) else "No time recorded"
+        elif left_before is not None and left_before > grace:
+            why = f"Left {left_before:.0f} min before the end"
+        elif has_mins:
+            why = f"Only {mins:.0f} of {span:.0f} min in the call"
         else:
-            why = "Left before the end"
+            why = "No time recorded"
         verdicts.append((stayed, why))
     df["Stayed"] = [v[0] for v in verdicts]
     df["Result"] = [v[1] for v in verdicts]
     df.attrs["span"] = span
+    df.attrs["end"] = end.strftime("%H:%M") if end is not None and not pd.isna(end) else ""
     return df
 
 
 def meet_save_report(day: str, df: pd.DataFrame) -> tuple[int, int]:
-    """Match report names/emails to the people who joined through the app that day."""
+    """Match each name in Google's report to a phone number: first the people who used
+    the Ignite link that day, then everyone on the member list (for people who
+    joined the Meet directly)."""
     joined = query_df("""SELECT t.phone_number, t.member_display_name, COALESCE(m.full_name, '') AS full_name,
                                 COALESCE(m.email, '') AS email
                          FROM google_meet_tracker t LEFT JOIN members m ON m.phone_number = t.phone_number
                          WHERE t.tracking_date = ?""", (day,))
+    everyone = query_df("SELECT phone_number, full_name, COALESCE(email, '') AS email FROM members")
     by_name, by_email = {}, {}
     for _, j in joined.iterrows():
         for n in (j["member_display_name"], j["full_name"]):
-            if _norm_name(n):
-                by_name.setdefault(_norm_name(n), j["phone_number"])
+            for k in _name_keys(n):
+                by_name.setdefault(k, j["phone_number"])
         if j["email"]:
             by_email.setdefault(j["email"].strip().casefold(), j["phone_number"])
+    member_name, member_email = {}, {}
+    for _, m in everyone.iterrows():
+        for k in _name_keys(m["full_name"]):
+            member_name.setdefault(k, m["phone_number"])
+        if m["email"]:
+            member_email.setdefault(m["email"].strip().casefold(), m["phone_number"])
+
+    def find_phone(name, email):
+        e = (email or "").strip().casefold()
+        if e and e in by_email:
+            return by_email[e]
+        for k in _name_keys(name):
+            if k in by_name:
+                return by_name[k]
+        if e and e in member_email:
+            return member_email[e]
+        for k in _name_keys(name):
+            if k in member_name:
+                return member_name[k]
+        return None
+
     matched = 0
     with closing(get_conn()) as conn, conn:
         conn.execute("DELETE FROM meet_stays WHERE tracking_date = ? AND method = 'report'", (day,))
         for _, r in df.iterrows():
-            phone = by_email.get((r["Email"] or "").casefold()) or by_name.get(_norm_name(r["Name"]))
+            phone = find_phone(r["Name"], r["Email"])
             matched += bool(phone)
             mins = None if r["Minutes"] is None or pd.isna(r["Minutes"]) else float(r["Minutes"])
             conn.execute("""INSERT OR REPLACE INTO meet_stays (tracking_date, phone_number, display_name, email, method,
@@ -907,64 +947,125 @@ def meet_save_report(day: str, df: pd.DataFrame) -> tuple[int, int]:
 
 STATUS_STAYED = "Stayed to the end"
 STATUS_EARLY = "Left early"
-STATUS_UNCONFIRMED = "Joined, not confirmed"
+STATUS_WAITING = "Joined (report not added yet)"
+STATUS_MISSING = "Used the link, not in the call"
+STATUS_UNCONFIRMED = STATUS_WAITING          # older name kept for compatibility
+MEET_COLUMNS = ["Name", "Phone", "Member On File", "Used Link (GMT)", "Minutes In Call", "Status", "Details"]
 
 
 def meet_day_summary(day: str) -> pd.DataFrame:
-    """One row per person for the day, with the best evidence of whether they stayed.
-    Order of trust: an admin's mark, then Google's report, then the closing code."""
+    """One row per person for the prayer day. Trust order: an admin's correction,
+    then Google's report. If the report is in and someone who used the link isn't
+    in it, they're flagged."""
     people = query_df(
         """SELECT t.phone_number AS phone, MIN(t.member_display_name) AS display,
                   COALESCE(m.full_name, '') AS member, strftime('%H:%M', MIN(t.join_time)) AS joined
            FROM google_meet_tracker t LEFT JOIN members m ON m.phone_number = t.phone_number
            WHERE t.tracking_date = ? GROUP BY t.phone_number ORDER BY MIN(t.join_time)""", (day,))
     stays = query_df("SELECT * FROM meet_stays WHERE tracking_date = ?", (day,))
+    has_report = bool((stays["method"] == "report").any()) if not stays.empty else False
     rank = {"manual": 0, "report": 1, "code": 2}
-    best = {}
+    best, report_mins = {}, {}
     for _, x in stays.iterrows():
-        key = x["phone_number"] if isinstance(x["phone_number"], str) and x["phone_number"] else "name:" + _norm_name(x["display_name"])
+        phone = x["phone_number"] if isinstance(x["phone_number"], str) and x["phone_number"] else ""
+        key = phone or "name:" + _norm_name(x["display_name"])
+        if x["method"] == "report" and x["minutes"] is not None and not pd.isna(x["minutes"]):
+            report_mins[key] = float(x["minutes"])
         if key not in best or rank[x["method"]] < rank[best[key]["method"]]:
             best[key] = x
-    out = []
 
-    def status_of(x):
+    def verdict(key):
+        x = best.get(key)
+        mins = report_mins.get(key)
+        mins_txt = "" if mins is None else f"{mins:.0f}"
         if x is None:
-            return STATUS_UNCONFIRMED, ""
-        how = {"manual": "marked by admin", "report": "Google Meet report", "code": "closing code"}[x["method"]]
-        mins = "" if x["minutes"] is None or pd.isna(x["minutes"]) else f", {float(x['minutes']):.0f} min"
-        return (STATUS_STAYED if x["stayed"] else STATUS_EARLY), f"{how}{mins}"
+            return (STATUS_MISSING if has_report else STATUS_WAITING), mins_txt, \
+                   ("Not found in Google's report for this prayer" if has_report else "")
+        detail = x["detail"] if isinstance(x["detail"], str) else ""
+        if x["method"] == "manual":
+            detail = "Corrected by admin"
+        return (STATUS_STAYED if x["stayed"] else STATUS_EARLY), mins_txt, detail
 
+    out, seen = [], set()
     for _, p in people.iterrows():
-        st_, how = status_of(best.pop(p["phone"], None))
-        out.append({"Meet Display Name": p["display"], "Phone": p["phone"], "Member On File": p["member"],
-                    "Joined (GMT)": p["joined"], "Status": st_, "How We Know": how})
+        status, mins, detail = verdict(p["phone"])
+        seen.add(p["phone"])
+        out.append({"Name": p["display"], "Phone": p["phone"], "Member On File": p["member"],
+                    "Used Link (GMT)": p["joined"], "Minutes In Call": mins, "Status": status, "Details": detail})
+    member_names = dict(query_df("SELECT phone_number, full_name FROM members").values.tolist())
     for key, x in best.items():
-        phone = x["phone_number"] if isinstance(x["phone_number"], str) else ""
-        if key.startswith("name:") or phone not in set(people["phone"]):
-            st_, how = status_of(x)
-            out.append({"Meet Display Name": x["display_name"], "Phone": phone,
-                        "Member On File": "", "Joined (GMT)": "", "Status": st_,
-                        "How We Know": how + " · joined without the app link"})
-    return pd.DataFrame(out, columns=["Meet Display Name", "Phone", "Member On File", "Joined (GMT)", "Status",
-                                      "How We Know"])
+        if key in seen:
+            continue
+        status, mins, detail = verdict(key)
+        phone = key if not key.startswith("name:") else ""
+        out.append({"Name": x["display_name"], "Phone": phone, "Member On File": member_names.get(phone, ""),
+                    "Used Link (GMT)": "", "Minutes In Call": mins, "Status": status,
+                    "Details": (detail + " · " if detail else "") + "joined the Meet without the Ignite link"})
+    return pd.DataFrame(out, columns=MEET_COLUMNS)
+
+
+def meet_days(start: str, end: str) -> list[str]:
+    q = query_df("""SELECT DISTINCT tracking_date AS d FROM google_meet_tracker WHERE tracking_date BETWEEN ? AND ?
+                    UNION SELECT DISTINCT tracking_date FROM meet_stays WHERE tracking_date BETWEEN ? AND ?
+                    ORDER BY d""", (start, end, start, end))
+    return [d for d in q["d"].tolist() if d]
 
 
 def meet_daily_totals(days: int = 30) -> pd.DataFrame:
-    dates = query_df("""SELECT DISTINCT tracking_date AS d FROM google_meet_tracker WHERE tracking_date >= date('now', ?)
-                        UNION SELECT DISTINCT tracking_date FROM meet_stays WHERE tracking_date >= date('now', ?)
-                        ORDER BY d""", (f"-{int(days)} days", f"-{int(days)} days"))
+    end = prayer_day()
     rows = []
-    for d in dates["d"]:
+    for d in meet_days((end - timedelta(days=days)).isoformat(), end.isoformat()):
         summary = meet_day_summary(d)
-        rows.append({"Date": d, "Joined": len(summary),
-                     "Stayed to the end": int((summary["Status"] == STATUS_STAYED).sum())})
-    return pd.DataFrame(rows, columns=["Date", "Joined", "Stayed to the end"])
+        present = summary[summary["Status"] != STATUS_MISSING]
+        rows.append({"Date": d, "Came": len(present), "Stayed to the end": int((summary["Status"] == STATUS_STAYED).sum())})
+    return pd.DataFrame(rows, columns=["Date", "Came", "Stayed to the end"])
+
+
+def meet_records(start: str, end: str) -> pd.DataFrame:
+    """Each person's prayer record for a period: how often they came, how often
+    they stayed to the end, and their average time in the call."""
+    days = meet_days(start, end)
+    agg = {}
+    for d in days:
+        for _, r in meet_day_summary(d).iterrows():
+            key = r["Phone"] or "name:" + _norm_name(r["Name"])
+            a = agg.setdefault(key, {"Name": r["Member On File"] or r["Name"], "Phone": r["Phone"], "came": 0,
+                                     "stayed": 0, "early": 0, "missing": 0, "mins": [], "last": ""})
+            if r["Member On File"]:
+                a["Name"] = r["Member On File"]
+            if r["Status"] == STATUS_MISSING:
+                a["missing"] += 1
+                continue
+            a["came"] += 1
+            a["stayed"] += r["Status"] == STATUS_STAYED
+            a["early"] += r["Status"] == STATUS_EARLY
+            if r["Minutes In Call"]:
+                a["mins"].append(float(r["Minutes In Call"]))
+            a["last"] = max(a["last"], d)
+    rows = [{"Name": a["Name"], "Phone": a["Phone"], "Days Came": a["came"],
+             "Out Of": len(days), "Stayed To The End": a["stayed"], "Left Early": a["early"],
+             "Used Link But Not In Call": a["missing"],
+             "Average Minutes": f"{round(sum(a['mins']) / len(a['mins']))} min" if a["mins"] else "—",
+             "Last Came": a["last"]} for a in agg.values()]
+    df = pd.DataFrame(rows, columns=["Name", "Phone", "Days Came", "Out Of", "Stayed To The End", "Left Early",
+                                     "Used Link But Not In Call", "Average Minutes", "Last Came"])
+    return df.sort_values(["Days Came", "Stayed To The End", "Name"], ascending=[False, False, True]).reset_index(drop=True)
+
+
+def meet_person_history(key: str, start: str, end: str) -> pd.DataFrame:
+    rows = []
+    for d in meet_days(start, end):
+        for _, r in meet_day_summary(d).iterrows():
+            if (r["Phone"] or "name:" + _norm_name(r["Name"])) == key:
+                rows.append({"Prayer Day": d, "Status": r["Status"], "Minutes In Call": r["Minutes In Call"],
+                             "Used Link (GMT)": r["Used Link (GMT)"], "Details": r["Details"]})
+    return pd.DataFrame(rows, columns=["Prayer Day", "Status", "Minutes In Call", "Used Link (GMT)", "Details"])
 
 
 def meet_full_export() -> pd.DataFrame:
     return query_df(
-        """SELECT tracking_date AS "Date", member_display_name AS "Meet Display Name", phone_number AS "Phone",
-                  strftime('%H:%M:%S', join_time) AS "Joined (GMT)"
+        """SELECT tracking_date AS "Prayer Day", member_display_name AS "Name", phone_number AS "Phone",
+                  strftime('%Y-%m-%d %H:%M:%S', join_time) AS "Used Link (GMT)"
            FROM google_meet_tracker ORDER BY join_time DESC""")
 
 
@@ -1876,6 +1977,15 @@ div.stButton > button, div.stFormSubmitButton > button, div.stDownloadButton > b
 [data-baseweb="popover"] li, [data-baseweb="menu"] li {{ color: var(--ink) !important; }}
 [data-testid="stMetricValue"], [data-testid="stMetricValue"] div {{ color: var(--ink) !important; }}
 [data-testid="stMetricLabel"] p {{ color: var(--muted) !important; }}
+/* button labels keep their own colours (white on purple, dark on white) */
+.stApp [data-testid="stBaseButton-primary"] p, .stApp [data-testid="stBaseButton-primaryFormSubmit"] p,
+.stApp a[data-testid="stBaseLinkButton-primary"] p, .stApp [class*="st-key-wa_"] a p {{ color: #fff !important; }}
+.stApp [data-testid="stBaseButton-secondary"] p, .stApp [data-testid="stBaseButton-secondaryFormSubmit"] p,
+.stApp a[data-testid="stBaseLinkButton-secondary"] p, .stApp [data-testid="stDownloadButton"] p {{ color: var(--ink) !important; }}
+.stApp [data-testid="stBaseButton-tertiary"] p {{ color: var(--royal) !important; }}
+.stApp .st-key-ig_footer_btn button p, .stApp .st-key-ig_footer_btn [data-testid="stBaseButton-tertiary"] p {{ color: var(--muted) !important; }}
+.ig-done p, .ig-tokencard p {{ color: #D9D3E6 !important; }}
+.ig-code .t {{ color: #CFC6E3 !important; }}
 
 /* ---- footer centring ---- */
 .st-key-ig_footer_btn > div, .st-key-ig_footer_btn [data-testid="stElementContainer"] {{ width:100% !important;
@@ -2970,120 +3080,48 @@ def live_gate_page():
         st.rerun()
 
 
-def meet_confirm_form(code_state: dict):
-    """End of prayer: members confirm they stayed by typing the closing code."""
-    done = st.session_state.get("meet_stayed")
-    if done:
-        st.markdown(f"""<div class="ig-done ig-done-success">
-                          <div class="ig-done-seal">{ICON_CHECK}</div>
-                          <div class="ig-done-kicker">Recorded · {esc(done['time'])} GMT</div>
-                          <h2>Thank you, {esc(done['first'])}</h2>
-                          <p>You're marked as having prayed with us to the end. God bless you.</p></div>""",
-                    unsafe_allow_html=True)
-        if st.button("Done", key="meet_stay_done", width="stretch"):
-            st.session_state.pop("meet_stayed", None)
-            st.rerun()
-        return
-    locked = st.session_state.get("meet_code_locked", 0)
-    if locked > time.time():
-        deny_card("Too many tries", f"Please wait {int(locked - time.time())} seconds and try again.")
-        return
-    nonce = st.session_state.form_nonce
-    with st.form(key=f"meet_stay_form_{nonce}"):
-        st.markdown('<div class="ig-step">Prayer has ended</div><div class="ig-formtitle">Confirm you stayed</div>'
-                    '<div class="ig-formnote">Enter the number you joined with today and the closing code '
-                    'announced at the end of prayer.</div>', unsafe_allow_html=True)
-        c1, c2 = st.columns([1, 1.5])
-        country = c1.selectbox("Country", COUNTRY_NAMES, format_func=country_label, key=f"meet_scc_{nonce}")
-        raw = c2.text_input("Phone number *", placeholder="e.g. 024 123 4567", autocomplete="tel", key=f"meet_sph_{nonce}")
-        code = st.text_input("Closing code *", placeholder="4 digits", max_chars=4, key=f"meet_scode_{nonce}")
-        go = st.form_submit_button("Confirm I stayed", type="primary", width="stretch", icon=":material/task_alt:")
-    if not go:
-        return
-    phone = to_intl(raw, country)
-    if not raw.strip() or phone_problem(phone):
-        show_errors([phone_problem(phone) or "Enter your phone number."])
-        return
-    fresh = meet_code_state()
-    if not fresh["active"]:
-        deny_card("The closing code has expired", "It's only open for a few minutes at the end of prayer. "
-                  "If you stayed, let one of the team know and they can mark you.", waiting=True)
-        return
-    day = today_local().isoformat()
-    name = meet_joined_name(phone, day)
-    if code.strip() != fresh["code"]:
-        st.session_state.meet_code_fails = st.session_state.get("meet_code_fails", 0) + 1
-        if st.session_state.meet_code_fails >= MAX_LOGIN_ATTEMPTS:
-            st.session_state.meet_code_locked = time.time() + LOCKOUT_SECONDS
-            st.session_state.meet_code_fails = 0
-        time.sleep(0.6)
-        deny_card("That code isn't right", "Check the code announced at the end of prayer and try again.")
-        return
-    if not name:
-        deny_card("We don't have you joining today", "This number didn't join today's prayer through the Ignite "
-                  "link. Next time, join from this page so your attendance counts.")
-        return
-    meet_record_stay(day, phone, name, "code")
-    st.session_state.meet_code_fails = 0
-    st.session_state.meet_stayed = {"first": first_name(name), "time": datetime.now(timezone.utc).strftime("%H:%M")}
-    st.session_state.form_nonce += 1
-    st.rerun()
-
-
 def meet_page():
     brand_row()
     url = get_app_setting("meet_url").strip()
     is_open = get_app_setting("meet_open", "1") == "1"
-    code_state = meet_code_state()
     go_to = st.session_state.get("meet_go")
+    page_heading("Daily prayer line", "Join the prayer room",
+                 "Type your name and number, and we'll take you straight in.")
     if go_to:
-        page_heading("Daily prayer room", "Join us on Google Meet")
         st.markdown(f"""<div class="ig-done ig-done-success">
                           <div class="ig-done-seal">{ICON_CHECK}</div>
-                          <div class="ig-done-kicker">Arrival recorded · {esc(go_to['time'])} GMT</div>
+                          <div class="ig-done-kicker">Recorded · {esc(go_to['time'])} GMT</div>
                           <h2>Welcome, {esc(go_to['first'])}</h2>
-                          <p>Opening the Google Meet prayer room… Please come back to this page at the end of
-                             prayer to confirm you stayed.</p></div>""", unsafe_allow_html=True)
-        redirect_browser(go_to["url"], "Open Google Meet", "meet")
+                          <p>Opening the prayer room… God bless you as you pray.</p></div>""", unsafe_allow_html=True)
+        redirect_browser(go_to["url"], "Open the prayer room", "meet")
         if st.button("Back", key="meet_back", width="stretch"):
             st.session_state.pop("meet_go", None)
             st.rerun()
         return
-    if code_state["active"] or st.session_state.get("meet_stayed"):
-        page_heading("Daily prayer room", "Thank you for praying with us",
-                     "Before you go, confirm you stayed to the end.")
-        meet_confirm_form(code_state)
-        if url.startswith("https://") and is_open:
-            with st.expander("Only joining now?"):
-                meet_join_form(url)
-        return
-    page_heading("Daily prayer room", "Join us on Google Meet",
-                 "Tell us who you are, then we'll take you straight into the room.")
     if not url.startswith("https://") or not is_open:
         deny_card("The prayer room isn't open right now", "Please check the WhatsApp group for today's time "
                   "and come back then.", waiting=True)
         return
     meet_join_form(url)
-    st.markdown('<div class="ig-note">At the end of prayer a closing code is announced. Come back to this page '
-                'and enter it, so we know you stayed with us to the end.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="ig-note">Please always join from this link. It\'s how your prayer attendance '
+                'is counted.</div>', unsafe_allow_html=True)
 
 
 def meet_join_form(url: str):
     nonce = st.session_state.form_nonce
     with st.form(key=f"meet_form_{nonce}"):
-        st.markdown('<div class="ig-formnote">Use the exact name you show on Google Meet, so we can match you '
-                    'in the room.</div>', unsafe_allow_html=True)
-        display = st.text_input("Your Google Meet display name *", placeholder="e.g. Ama Mensah", key=f"meet_nm_{nonce}")
+        display = st.text_input("Your name (as it shows on Google Meet) *", placeholder="e.g. Ama Mensah",
+                                key=f"meet_nm_{nonce}")
         c1, c2 = st.columns([1, 1.5])
         country = c1.selectbox("Country", COUNTRY_NAMES, format_func=country_label, key=f"meet_cc_{nonce}")
         raw = c2.text_input("Phone number *", placeholder="e.g. 024 123 4567", autocomplete="tel", key=f"meet_ph_{nonce}")
-        go = st.form_submit_button("Join room", type="primary", width="stretch", icon=":material/videocam:")
+        go = st.form_submit_button("Join prayer", type="primary", width="stretch", icon=":material/videocam:")
     if not go:
         return
     phone = to_intl(raw, country)
     errors = []
     if len(display.strip()) < 2:
-        errors.append("Enter your Google Meet display name.")
+        errors.append("Enter your name.")
     problem = phone_problem(phone) if raw.strip() else "Enter your phone number."
     if country == "Other country" and raw.strip() and not raw.strip().startswith(("+", "00")):
         problem = "For other countries, start with + and the country code."
@@ -3325,12 +3363,12 @@ def overview_tab():
     mc = query_df("""SELECT
             (SELECT COUNT(*) FROM masterclass_registrations WHERE payment_status = 'Pending Verification') AS pending,
             (SELECT COUNT(*) FROM masterclass_registrations) AS mc_total,
-            (SELECT COUNT(DISTINCT phone_number) FROM google_meet_tracker WHERE tracking_date = date('now')) AS meet_today
+            (SELECT COUNT(DISTINCT phone_number) FROM google_meet_tracker WHERE tracking_date = date('now', '-6 hours')) AS meet_today
         """).iloc[0]
     m = st.columns(3)
     m[0].metric("Masterclass registrations", int(mc["mc_total"]))
     m[1].metric("Payments waiting for the PA", int(mc["pending"]))
-    m[2].metric("In the Google Meet today", int(mc["meet_today"]))
+    m[2].metric("Joined prayer line today", int(mc["meet_today"]))
     summary = events_summary()
     if summary.empty:
         st.caption("No events yet. Create your first one in the **Events** tab.")
@@ -4370,100 +4408,163 @@ def masterclass_tab(pa_only: bool = False):
 # Admin: daily Google Meet
 # ---------------------------------------------------------------------------
 def meet_settings_section():
-    st.markdown("#### Your Google Meet room")
-    st.caption("Paste the link to your own Google Meet room (your paid Workspace account works). Members never see "
-               "it on a page: they go through the Ignite join link, which records them and then opens your room.")
+    st.markdown("#### Prayer room link")
     with st.form("meet_settings"):
-        url = st.text_input("Google Meet link", value=get_app_setting("meet_url"),
+        url = st.text_input("Your Google Meet link", value=get_app_setting("meet_url"),
                             placeholder="Paste your link, e.g. https://meet.google.com/xxx-xxxx-xxx")
-        c1, c2, c3 = st.columns(3)
-        is_open = c1.toggle("Room open", value=get_app_setting("meet_open", "1") == "1",
-                            help="When off, the join page says the room isn't open.")
-        times = [""] + [f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 15, 30, 45)]
-        start = c2.selectbox("Prayer starts (GMT)", times, index=times.index(meet_setting("meet_start"))
-                             if meet_setting("meet_start") in times else 0, format_func=lambda t: t or "Not set")
-        end = c3.selectbox("Prayer ends (GMT)", times, index=times.index(meet_setting("meet_end"))
-                           if meet_setting("meet_end") in times else 0, format_func=lambda t: t or "Not set")
-        st.markdown("**When does someone count as having stayed?**")
-        c4, c5, c6 = st.columns(3)
-        min_pct = c4.number_input("In the call for at least (% of the prayer)", 10, 100,
-                                  int(meet_setting("meet_min_pct")), step=5)
-        grace = c5.number_input("And still there within (minutes of the end)", 0, 60, int(meet_setting("meet_grace")))
-        code_min = c6.number_input("Closing code stays open for (minutes)", 2, 60, int(meet_setting("meet_code_minutes")))
+        is_open = st.toggle("Room open", value=get_app_setting("meet_open", "1") == "1",
+                            help="On: members can join through the Ignite link. Off: the link says the room isn't open.")
         if st.form_submit_button("Save", type="primary"):
             if url.strip() and not url.strip().startswith("https://"):
                 st.error("Paste the full Meet link, starting with https://")
             else:
-                for k, v in {"meet_url": url.strip(), "meet_open": "1" if is_open else "0", "meet_start": start,
-                             "meet_end": end, "meet_min_pct": str(int(min_pct)), "meet_grace": str(int(grace)),
-                             "meet_code_minutes": str(int(code_min))}.items():
-                    set_app_setting(k, v)
-                notify("Updated the Google Meet room settings.")
+                set_app_setting("meet_url", url.strip())
+                set_app_setting("meet_open", "1" if is_open else "0")
+                notify("Updated the prayer room link.")
+                st.rerun()
+    with st.expander("When does someone count as 'stayed to the end'?"):
+        st.caption("The end is when the meeting actually finished (the last person to leave), whatever time that is.")
+        with st.form("meet_rules"):
+            c1, c2 = st.columns(2)
+            grace = c1.number_input("They left no more than this many minutes before the end", 0, 120,
+                                    int(meet_setting("meet_grace")))
+            min_pct = c2.number_input("And were in the call for at least this % of the prayer", 0, 100,
+                                      int(meet_setting("meet_min_pct")), step=5)
+            if st.form_submit_button("Save rules"):
+                set_app_setting("meet_grace", str(int(grace)))
+                set_app_setting("meet_min_pct", str(int(min_pct)))
+                notify("Updated the stayed-to-the-end rules.")
                 st.rerun()
 
 
-def meet_code_section():
-    state = meet_code_state()
-    minutes = int(meet_setting("meet_code_minutes"))
-    st.markdown("#### Closing code")
-    if state["active"]:
-        until = datetime.fromtimestamp(state["until"], timezone.utc).strftime("%H:%M")
-        st.markdown(f"""<div class="ig-code"><div class="k">Today's closing code</div>
-                          <div class="n">{esc(state['code'])}</div>
-                          <div class="t">Open until {until} GMT. Say it in the room or post it in the Meet chat.</div></div>""",
-                    unsafe_allow_html=True)
-        if st.button("Close the code now", key="meet_code_close", width="stretch"):
-            meet_close_code()
-            notify("Closed today's closing code.")
-            st.rerun()
-    else:
-        st.caption(f"In the last minutes of prayer, reveal a code. Members open the Ignite prayer link again and type it "
-                   f"to confirm they stayed. It works on any Google plan and closes itself after {minutes} minutes, "
-                   "so people who left early can't get it later.")
-        if st.button("Reveal closing code", key="meet_code_open", type="primary", width="stretch",
-                     icon=":material/key:"):
-            code = meet_open_code(minutes)
-            notify(f"Revealed today's closing code ({code}).")
-            st.rerun()
+def meet_share_section():
+    st.markdown("#### Share with members")
+    base = current_base_url()
+    if not base_url_ok(base):
+        st.warning("Set the app's web address (Members → Membership link) to get the prayer link.")
+        return
+    st.code(meet_link(base), language=None)
+    msg = (f"Prayer line is on. Join here so your attendance is counted:\n{meet_link(base)}\n\n{APP_NAME}")
+    with st.container(key="wa_meet_share"):
+        st.link_button("Share on WhatsApp", f"https://wa.me/?text={quote(msg)}", width="stretch",
+                       icon=":material/chat:")
+    with st.expander("Printable QR poster"):
+        poster_block(meet_link(base), "Daily Prayer Line", "", "", "", "Google Meet",
+                     "Scan to join the prayer room", "Ignite_prayer_line", "meet")
 
 
 def meet_report_section(day: date):
-    with st.expander("Upload Google Meet's attendance report (most accurate)"):
-        st.caption("Google sends this report to the meeting organiser on Workspace Business Plus, Enterprise and "
-                   "Education plans, when attendance tracking is on. It shows how long each person was in the call. "
-                   "Download it as Excel or CSV and upload it here. Each person's name or email is matched to the "
-                   "people who joined through the Ignite link.")
-        upload = st.file_uploader("Attendance report (.xlsx or .csv)", type=["xlsx", "csv"], key="meet_report_file")
+    has = meet_report_exists(day.isoformat())
+    title = "Google's attendance report for this prayer ✓ added" if has else "Add Google's attendance report for this prayer"
+    with st.expander(title, expanded=not has):
+        st.markdown(
+            '<div class="ig-note"><b>After prayer, whenever it ends:</b><br>'
+            '1. The person who created the Meet gets an email from Google called <i>Attendance report</i>.<br>'
+            '2. Open the Google Sheet in that email, then <b>File → Download → Microsoft Excel (.xlsx)</b>.<br>'
+            '3. Upload that file here and press <b>Save</b>. That\'s it.</div>', unsafe_allow_html=True)
+        st.caption("No email? In the Meet, the host turns on Host controls → Attendance tracking. "
+                   "For a recurring prayer meeting it stays on for the next times.")
+        upload = st.file_uploader("Attendance report (.xlsx or .csv)", type=["xlsx", "csv"],
+                                  key=f"meet_report_file_{day.isoformat()}")
         if not upload:
             return
         try:
-            table = _read_report_table(upload)
-            meeting_minutes = None
-            ms, me = meet_setting("meet_start"), meet_setting("meet_end")
-            if ms and me:
-                h1, m1 = map(int, ms.split(":"))
-                h2, m2 = map(int, me.split(":"))
-                meeting_minutes = ((h2 * 60 + m2) - (h1 * 60 + m1)) % (24 * 60) or None
-            df = parse_attendance_report(table, int(meet_setting("meet_grace")), int(meet_setting("meet_min_pct")),
-                                         meeting_minutes)
+            df = parse_attendance_report(_read_report_table(upload), int(meet_setting("meet_grace")),
+                                         int(meet_setting("meet_min_pct")))
         except ValueError as err:
             st.error(str(err))
             return
         except Exception:
-            st.error("That file couldn't be read. Download the report from Google Sheets as .xlsx or .csv and try again.")
+            st.error("That file couldn't be read. Download the report from Google Sheets as .xlsx and try again.")
             return
         view = df[["Name", "Email", "Minutes", "Result"]].copy()
         view["Minutes"] = view["Minutes"].map(lambda v: "" if v is None or pd.isna(v) else f"{v:.0f}")
-        st.caption(f"Prayer length used: {df.attrs['span']:.0f} min · stayed = in the call at least "
-                   f"{meet_setting('meet_min_pct')}% of it and still there within {meet_setting('meet_grace')} min of the end.")
+        end_txt = f", ended about {df.attrs['end']}" if df.attrs.get("end") else ""
+        st.caption(f"Prayer lasted about {df.attrs['span']:.0f} min{end_txt}. "
+                   f"{int(df['Stayed'].sum())} stayed to the end, {int((~df['Stayed']).sum())} left early.")
         st.dataframe(view, hide_index=True, width="stretch", height=260)
-        st.caption(f"{int(df['Stayed'].sum())} stayed to the end · {int((~df['Stayed']).sum())} left early")
-        if st.button(f"Save this report for {day.strftime('%a %d %b %Y')}", type="primary", key="meet_report_save"):
+        if st.button(f"Save this report for the prayer of {day.strftime('%a %d %b')}", type="primary",
+                     key=f"meet_report_save_{day.isoformat()}"):
             matched, total = meet_save_report(day.isoformat(), df)
-            st.session_state.pop("meet_report_file", None)
-            notify(f"Saved the Google Meet report for {day.isoformat()}: {total} people, {matched} matched to the "
-                   "Ignite join list.")
+            notify(f"Saved Google's report for {day.isoformat()}: {total} people in the call, "
+                   f"{matched} matched to a phone number.")
             st.rerun()
+
+
+def meet_day_section():
+    st.markdown("#### Prayer day")
+    c1, c2 = st.columns([1, 2])
+    day = c1.date_input("Prayer of", value=prayer_day(), format="DD/MM/YYYY", key="meet_day",
+                        help="A prayer that runs past midnight counts for the evening it started.")
+    summary = meet_day_summary(day.isoformat())
+    has_report = meet_report_exists(day.isoformat())
+    m = st.columns(4)
+    m[0].metric("Used the link", int((summary["Used Link (GMT)"] != "").sum()))
+    m[1].metric("Stayed to the end", int((summary["Status"] == STATUS_STAYED).sum()) if has_report else "—")
+    m[2].metric("Left early", int((summary["Status"] == STATUS_EARLY).sum()) if has_report else "—")
+    m[3].metric("Used link, not in call", int((summary["Status"] == STATUS_MISSING).sum()) if has_report else "—",
+                help="They opened the Ignite link, but Google's report doesn't show them in the meeting.")
+    meet_report_section(day)
+    if summary.empty:
+        st.caption("Nobody joined through the Ignite link for this prayer yet.")
+        return
+    options = ["Everyone", STATUS_STAYED, STATUS_EARLY, STATUS_MISSING, STATUS_WAITING]
+    filt = c2.radio("Show", options, horizontal=True, key="meet_filter")
+    view = summary if filt == "Everyone" else summary[summary["Status"] == filt]
+    shown = view.copy()
+    shown["Phone"] = shown["Phone"].map(fmt_phone)
+    st.dataframe(shown, hide_index=True, width="stretch", height=340)
+    download_pair(summary, f"Ignite_prayer_{day.isoformat()}", "Prayer attendance", "meet_day_dl")
+    people = summary[summary["Phone"] != ""]
+    if not people.empty:
+        with st.expander("Correct someone"):
+            labels = {r["Phone"]: f"{r['Name']} · {fmt_phone(r['Phone'])} · {r['Status']}" for _, r in people.iterrows()}
+            who = st.selectbox("Person", list(labels), format_func=labels.get, key="meet_fix_who")
+            name = people.loc[people["Phone"] == who, "Name"].iloc[0]
+            b1, b2, b3 = st.columns(3)
+            if b1.button("Mark as stayed", key="meet_fix_yes", width="stretch"):
+                meet_record_stay(day.isoformat(), who, name, "manual", True)
+                notify(f"Marked {name} as stayed to the end on {day.isoformat()}.")
+                st.rerun()
+            if b2.button("Mark as left early", key="meet_fix_no", width="stretch"):
+                meet_record_stay(day.isoformat(), who, name, "manual", False)
+                notify(f"Marked {name} as left early on {day.isoformat()}.")
+                st.rerun()
+            if b3.button("Undo my correction", key="meet_fix_clear", width="stretch"):
+                meet_remove_stay(day.isoformat(), who, "manual")
+                st.rerun()
+
+
+def meet_records_section():
+    st.markdown("#### Prayer records")
+    st.caption("Who comes faithfully, and who stays to the end. Use it when someone says they've been coming.")
+    periods = {"Last 7 days": 7, "Last 30 days": 30, "Last 90 days": 90, "All time": 3650}
+    c1, c2 = st.columns([1, 2])
+    pick = c1.selectbox("Period", list(periods), index=1, key="meet_rec_period")
+    end = prayer_day()
+    start = (end - timedelta(days=periods[pick] - 1)).isoformat()
+    rec = meet_records(start, end.isoformat())
+    if rec.empty:
+        st.caption("No prayer attendance recorded in this period yet.")
+        return
+    search = c2.text_input("Find a person", placeholder="Name or phone number", key="meet_rec_search")
+    view = rec
+    if search.strip():
+        digits = re.sub(r"\D", "", search).lstrip("0")
+        mask = view["Name"].str.contains(search.strip(), case=False, regex=False)
+        if digits:
+            mask |= view["Phone"].str.contains(digits, regex=False)
+        view = view[mask]
+    shown = view.copy()
+    shown["Phone"] = shown["Phone"].map(fmt_phone)
+    st.dataframe(shown, hide_index=True, width="stretch", height=360)
+    download_pair(rec, f"Ignite_prayer_records_{pick.lower().replace(' ', '_')}", "Prayer records", "meet_rec_dl")
+    keys = {(r["Phone"] or "name:" + _norm_name(r["Name"])): f"{r['Name']} · {fmt_phone(r['Phone']) or 'no number'}"
+            for _, r in view.iterrows()}
+    who = st.selectbox("See one person's prayer days", [""] + list(keys),
+                       format_func=lambda k: keys.get(k, "Choose a person…"), key="meet_rec_who")
+    if who:
+        st.dataframe(meet_person_history(who, start, end.isoformat()), hide_index=True, width="stretch")
 
 
 def meet_tab():
@@ -4471,72 +4572,19 @@ def meet_tab():
     with left:
         meet_settings_section()
     with right:
-        meet_code_section()
+        meet_share_section()
     st.divider()
-    st.markdown("#### Who prayed with us")
-    c1, c2 = st.columns([1, 2])
-    day = c1.date_input("Day", value=today_local(), format="DD/MM/YYYY", key="meet_day")
-    summary = meet_day_summary(day.isoformat())
-    stayed = int((summary["Status"] == STATUS_STAYED).sum())
-    early = int((summary["Status"] == STATUS_EARLY).sum())
-    unconf = int((summary["Status"] == STATUS_UNCONFIRMED).sum())
-    m = st.columns(4)
-    m[0].metric("Joined", len(summary))
-    m[1].metric("Stayed to the end", stayed)
-    m[2].metric("Left early", early)
-    m[3].metric("Joined, not confirmed", unconf,
-                help="Joined through the Ignite link but never typed the closing code, and no report covers them yet.")
-    meet_report_section(day)
-    if summary.empty:
-        st.caption("Nobody joined through the app on this day.")
-    else:
-        filt = c2.radio("Show", ["Everyone", STATUS_STAYED, STATUS_EARLY, STATUS_UNCONFIRMED], horizontal=True,
-                        key="meet_filter")
-        view = summary if filt == "Everyone" else summary[summary["Status"] == filt]
-        shown = view.copy()
-        shown["Phone"] = shown["Phone"].map(lambda p: fmt_phone(p) if p else "")
-        st.dataframe(shown, hide_index=True, width="stretch", height=340)
-        download_pair(summary, f"Ignite_prayer_{day.isoformat()}", "Prayer attendance", "meet_day_dl")
-        people = summary[summary["Phone"] != ""]
-        if not people.empty:
-            with st.expander("Correct someone's status"):
-                labels = {r["Phone"]: f"{r['Meet Display Name']} · {fmt_phone(r['Phone'])} · {r['Status']}"
-                          for _, r in people.iterrows()}
-                who = st.selectbox("Person", list(labels), format_func=labels.get, key="meet_fix_who")
-                b1, b2, b3 = st.columns(3)
-                name = people.loc[people["Phone"] == who, "Meet Display Name"].iloc[0]
-                if b1.button("Mark as stayed", key="meet_fix_yes", width="stretch"):
-                    meet_record_stay(day.isoformat(), who, name, "manual", True)
-                    notify(f"Marked {name} as stayed to the end on {day.isoformat()}.")
-                    st.rerun()
-                if b2.button("Mark as left early", key="meet_fix_no", width="stretch"):
-                    meet_record_stay(day.isoformat(), who, name, "manual", False)
-                    notify(f"Marked {name} as left early on {day.isoformat()}.")
-                    st.rerun()
-                if b3.button("Clear my correction", key="meet_fix_clear", width="stretch"):
-                    meet_remove_stay(day.isoformat(), who, "manual")
-                    st.rerun()
+    meet_day_section()
+    st.divider()
+    meet_records_section()
     totals = meet_daily_totals(30)
     if not totals.empty:
         st.markdown("#### Last 30 days")
         st.bar_chart(totals.set_index("Date"), color=[GOLD, ROYAL], stack=False, y_label="People", x_label="")
-    with st.expander("Share the join link"):
-        base = current_base_url()
-        if base_url_ok(base):
-            st.markdown("Share this instead of the Meet link, so attendance is recorded.")
-            st.code(meet_link(base), language=None)
-            msg = (f"Our prayer room is open. Join here so we can see you came:\n{meet_link(base)}\n\n"
-                   f"Please stay to the end and enter the closing code on the same page.\n{APP_NAME}")
-            st.link_button("Share on WhatsApp", f"https://wa.me/?text={quote(msg)}", type="primary")
-            poster_block(meet_link(base), "Daily Prayer Room", "", "", "", "Google Meet",
-                         "Scan to join the prayer room", "Ignite_google_meet", "meet")
-        else:
-            st.warning("Set the app's web address (Members → Membership link) to get the share link.")
-    with st.expander("Export every join"):
-        if True:
-            full = meet_full_export()
-            st.caption(f"{len(full)} join(s) recorded in total.")
-            download_pair(full, "Ignite_meet_all", "Google Meet", "meet_all_dl")
+    with st.expander("Export every time someone used the prayer link"):
+        full = meet_full_export()
+        st.caption(f"{len(full)} record(s).")
+        download_pair(full, "Ignite_prayer_link_log", "Prayer link log", "meet_all_dl")
 
 def admin_page():
     if not admin_is_authenticated():
