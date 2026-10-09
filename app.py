@@ -2,11 +2,14 @@
 Ignite Prayer Network: Membership, Event Registration & Check-In
 ================================================================
 
-One Streamlit app with four public pages and a private admin portal.
+One Streamlit app with seven public pages and a private admin portal.
 
   * Arrival check-in (each event's QR code)   /?event=<id>
   * Pre-registration (shared before the day)  /?event=<id>&mode=register
   * Member registration (share on WhatsApp)   /?mode=join
+  * Prophet Masterclass enrolment             /?mode=masterclass
+  * Join Live Masterclass Room (the gate)     /?mode=live
+  * Daily Google Meet prayer room             /?mode=meet
   * Admin portal                              tap the (c) line at the foot of any
                                               member page, or open /?view=admin
 
@@ -22,10 +25,16 @@ Records are kept apart
   * Phone numbers are stored in international format (+233..., +44..., +1...),
     so members in Ghana, the UK, the USA, the UAE and elsewhere all work.
 
-Settings (Streamlit Cloud: Settings -> Secrets)
+Where the data lives
+  On Render, attach a persistent disk mounted at /data. The database is then
+  kept at /data/ignite_network.db and survives restarts and redeploys.
+  Without a /data folder (your own computer) it sits next to this file.
+  IGNITE_DB_PATH overrides both.
+
+Settings (Render: Environment variables. Streamlit Cloud: Secrets)
     ADMIN_USERNAME = "admin"
-    ADMIN_PASSWORD = "your-strong-password"
-    APP_BASE_URL   = "https://your-app-name.streamlit.app"
+    ADMIN_PASSWORD = "IgniteAdmin2026"      # the master password; change it here
+    APP_BASE_URL   = "https://your-app.onrender.com"
 
 """
 
@@ -34,8 +43,10 @@ import hashlib
 import hmac
 import html
 import io
+import json
 import os
 import re
+import secrets
 import sqlite3
 import tempfile
 import time
@@ -52,12 +63,14 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps, UnidentifiedImageError
 # Settings (change here, or override with Streamlit secrets)
 # ---------------------------------------------------------------------------
 APP_NAME = "Ignite Prayer Network"
-DB_PATH = "ignite_network.db"
+DB_FILENAME = "ignite_network.db"
+PERSISTENT_DIR = "/data"            # Render persistent disk mount path
 DEFAULT_ADMIN_USERNAME = "admin"
 DEFAULT_ADMIN_PASSWORD = "IgniteAdmin2026"     # change before going live (use Secrets)
 TEAM_ROLES = {
-    "Admin": "Full access: events, members, messages, exports, backups and the team",
+    "Admin": "Full access: events, members, masterclass, Google Meet, exports, backups and the team",
     "Usher": "Event-day helper: live check-in list and manual check-in only",
+    "PA": "Masterclass payments: sees masterclass registrations and approves payments only",
 }
 EVENT_TYPES = ["Asteri", "Shekinah Glory", "Impromptu"]
 # What members see for each programme type. Change these freely.
@@ -86,6 +99,11 @@ DIAL_CODES = {c[0]: c[1] for c in COUNTRIES}
 FLAGS = {c[0]: c[2] for c in COUNTRIES}
 
 CONFIRM_SECONDS = 7          # how long the "Submitted, thank you" screen stays up
+CHECKIN_CONFIRM_SECONDS = 2  # the door check-in clears itself faster, for the next person in line
+MC_TYPES = ["Free", "Paid"]
+MC_FREE, MC_PENDING, MC_PAID = "Free Approved", "Pending Verification", "Paid Approved"
+MC_APPROVED = (MC_FREE, MC_PAID)
+DEFAULT_PA_WHATSAPP = "+17813309525"   # used until a different number is saved in the admin portal
 ADMIN_SESSION_MINUTES = 30
 MAX_LOGIN_ATTEMPTS = 5
 LOCKOUT_SECONDS = 60
@@ -93,29 +111,58 @@ FLYER_MAX_UPLOAD_MB = 10
 FLYER_MAX_WIDTH = 1200
 LEDGER_REFRESH_SECONDS = 15
 
-# Palette: midnight, royal purple and glory gold, with a small flame accent.
-INK = "#1F1A33"        # deep midnight (text, dark surfaces)
-ROYAL = "#4B2E83"      # royal purple (buttons, highlights)
-ROYAL_DARK = "#35205F"
-GOLD = "#C9A24B"       # glory gold (accents)
-GOLD_TEXT = "#8C6A1E"  # gold that stays readable on light backgrounds
-FLAME = "#E0662A"      # the Ignite flame
-PAPER = "#FBF8F3"      # ivory page
-SAND = "#F3EEE6"       # field backgrounds
-LINE = "#E6DFD3"
-MUTED = "#6E6780"
-EMBER = ROYAL          # accent used by posters and older code
-EMBER_DARK = ROYAL_DARK
-TYPE_COLOURS = {"Asteri": "#2E4A8B", "Shekinah Glory": GOLD_TEXT, "Impromptu": "#2F6B5A"}
+# Screen palette: obsidian glass with Ignite red.
+OBSIDIAN = "#0B0F17"   # page background
+SURFACE = "#121826"    # solid fallback behind the glass cards
+TEXT = "#F5F7FA"       # main text
+TEXT_SOFT = "#C9CFDA"
+MUTED = "#8B94A7"      # secondary text
+RED = "#E50914"        # Ignite red (buttons, highlights)
+RED_DARK = "#B20710"
+RED_GLOW = "rgba(229,9,20,.45)"
+GREEN = "#22C55E"      # success
+AMBER = "#F5B841"      # waiting / pending
+GLASS = "rgba(255,255,255,.045)"
+GLASS_LINE = "rgba(255,255,255,.10)"
+TYPE_COLOURS = {"Asteri": "#7AA2FF", "Shekinah Glory": "#F5C45C", "Impromptu": "#5ED3A8"}
+
+# Print palette for the A4 posters (they go on paper, so they stay light).
+INK = "#0B0F17"
+PAPER = "#FFFFFF"
+LINE = "#E3E5EA"
+POSTER_MUTED = "#5B6272"
+POSTER_RED = "#D10812"
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 
 def get_setting(key: str, default: str = "") -> str:
-    """Read a value from Streamlit secrets, falling back to the default."""
+    """Read a setting from an environment variable (Render), then Streamlit
+    secrets (Streamlit Cloud), falling back to the default."""
+    value = os.environ.get(key)
+    if value not in (None, ""):
+        return value
     try:
         return str(st.secrets[key])
     except Exception:
         return default
+
+
+def resolve_db_path() -> str:
+    """Use Render's persistent disk when it's there, so nothing is lost on a
+    restart or redeploy. Fall back to the app folder for local testing."""
+    override = os.environ.get("IGNITE_DB_PATH", "").strip()
+    if override:
+        folder = os.path.dirname(os.path.abspath(override))
+        os.makedirs(folder, exist_ok=True)
+        return override
+    if os.path.isdir(PERSISTENT_DIR) and os.access(PERSISTENT_DIR, os.W_OK):
+        return os.path.join(PERSISTENT_DIR, DB_FILENAME)
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), DB_FILENAME)
+
+
+DB_PATH = resolve_db_path()
+DB_IS_PERSISTENT = os.path.abspath(DB_PATH).startswith(PERSISTENT_DIR + os.sep) or bool(
+    os.environ.get("IGNITE_DB_PATH", "").strip())
 
 
 # ---------------------------------------------------------------------------
@@ -131,8 +178,8 @@ CREATE TABLE IF NOT EXISTS events (
     venue       TEXT,
     is_open     INTEGER NOT NULL DEFAULT 1,   -- 1 = day-of check-in is open
     prereg_open INTEGER NOT NULL DEFAULT 1,   -- 1 = event uses pre-registration
-    prereg_deadline TEXT,
-    uses_checkin INTEGER NOT NULL DEFAULT 1,  -- 0 = pre-registration only, no check-in at the venue                     -- 'YYYY-MM-DD HH:MM' Ghana time; pre-registration closes then
+    prereg_deadline TEXT,                     -- 'YYYY-MM-DD HH:MM' Ghana time; pre-registration closes then
+    uses_checkin INTEGER NOT NULL DEFAULT 1,  -- 0 = pre-registration only, no check-in at the venue
     created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     flyer_bytes BLOB                          -- programme flyer, stored as JPEG
 );
@@ -180,7 +227,7 @@ CREATE TABLE IF NOT EXISTS admins (
     full_name      TEXT NOT NULL,
     username       TEXT NOT NULL UNIQUE COLLATE NOCASE,
     password_hash  TEXT NOT NULL,                 -- salted PBKDF2, never the password
-    role           TEXT NOT NULL CHECK (role IN ('Admin', 'Usher')),
+    role           TEXT NOT NULL CHECK (role IN ('Admin', 'Usher', 'PA')),
     is_active      INTEGER NOT NULL DEFAULT 1,
     created_by     TEXT,
     created_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -201,6 +248,54 @@ CREATE TABLE IF NOT EXISTS settings (
     value  TEXT
 );
 
+-- Prophet Masterclass ---------------------------------------------------------
+CREATE TABLE IF NOT EXISTS masterclass_sessions (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_name   TEXT NOT NULL,
+    session_type   TEXT NOT NULL CHECK (session_type IN ('Free', 'Paid')),
+    active_status  INTEGER NOT NULL DEFAULT 1,    -- 1 = open for enrolment and the live room
+    streaming_url  TEXT,                          -- the secret stream link; never shown on a page
+    session_date   TEXT,                          -- YYYY-MM-DD, optional
+    price_note     TEXT,                          -- e.g. "GHS 150 by MoMo to 024 000 0000"
+    created_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS masterclass_registrations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    reg_id          TEXT NOT NULL UNIQUE,         -- the member's token, e.g. IGNITE-8921
+    session_id      INTEGER NOT NULL REFERENCES masterclass_sessions(id),
+    full_name       TEXT NOT NULL,
+    email           TEXT,
+    phone           TEXT NOT NULL,                -- international format
+    payment_status  TEXT NOT NULL
+                    CHECK (payment_status IN ('Free Approved', 'Pending Verification', 'Paid Approved')),
+    approved_by     TEXT,
+    approved_at     DATETIME,
+    created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (session_id, phone)
+);
+
+-- Every time someone is let into a live room.
+CREATE TABLE IF NOT EXISTS masterclass_entries (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    reg_id      TEXT NOT NULL,
+    session_id  INTEGER NOT NULL REFERENCES masterclass_sessions(id),
+    entered_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Daily Google Meet prayer room ----------------------------------------------------
+CREATE TABLE IF NOT EXISTS google_meet_tracker (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    member_display_name  TEXT NOT NULL,
+    phone_number         TEXT NOT NULL,
+    tracking_date        DATE NOT NULL,               -- the day in Ghana time
+    join_time            TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_mc_reg_session   ON masterclass_registrations(session_id);
+CREATE INDEX IF NOT EXISTS idx_mc_reg_phone     ON masterclass_registrations(phone);
+CREATE INDEX IF NOT EXISTS idx_mc_entry_session ON masterclass_entries(session_id);
+CREATE INDEX IF NOT EXISTS idx_meet_date        ON google_meet_tracker(tracking_date);
 CREATE INDEX IF NOT EXISTS idx_attendance_event  ON attendance(event_id);
 CREATE INDEX IF NOT EXISTS idx_attendance_member ON attendance(member_id);
 CREATE INDEX IF NOT EXISTS idx_prereg_event      ON pre_registrations(event_id);
@@ -230,6 +325,10 @@ MIGRATIONS = [
     ("events", "prereg_deadline", "TEXT"),
     ("events", "uses_checkin", "INTEGER NOT NULL DEFAULT 1"),
     ("members", "birth_month", "INTEGER"),
+    ("masterclass_sessions", "session_date", "TEXT"),
+    ("masterclass_sessions", "price_note", "TEXT"),
+    ("masterclass_registrations", "approved_by", "TEXT"),
+    ("masterclass_registrations", "approved_at", "DATETIME"),
 ]
 DATA_VERSION = "intl-phones-1"   # bump when a one-off data upgrade is added
 
@@ -277,10 +376,28 @@ def _upgrade_phone_numbers(conn: sqlite3.Connection):
     conn.execute("UPDATE members SET country = 'Ghana' WHERE country IS NULL AND phone_number LIKE '+233%'")
 
 
+def _allow_pa_role(conn: sqlite3.Connection):
+    """Older databases only allowed Admin and Usher. Rebuild the team table
+    (keeping every account) so the PA role can be used."""
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='admins'").fetchone()
+    if not row or "'PA'" in (row["sql"] or ""):
+        return
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(admins)")]
+    conn.execute("ALTER TABLE admins RENAME TO admins_old")
+    conn.execute("CREATE TABLE admins" + SCHEMA.split("CREATE TABLE IF NOT EXISTS admins", 1)[1].split(");", 1)[0] + ")")
+    keep = ", ".join(c for c in cols if c in
+                     {"id", "full_name", "username", "password_hash", "role", "is_active", "created_by",
+                      "created_at", "last_login"})
+    conn.execute(f"INSERT INTO admins ({keep}) SELECT {keep} FROM admins_old")
+    conn.execute("DROP TABLE admins_old")
+
+
 def migrate(conn: sqlite3.Connection):
     """Add missing columns, create missing tables, and run one-off data
     upgrades. Existing records are never removed."""
     existing = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "admins" in existing:
+        _allow_pa_role(conn)
     for table, column, decl in MIGRATIONS:
         if table in existing:
             cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
@@ -300,6 +417,10 @@ SCHEMA_VERSION = hashlib.sha1((SCHEMA + repr(MIGRATIONS) + DATA_VERSION).encode(
 
 @st.cache_resource
 def _init_db(version: str) -> bool:
+    folder = os.path.dirname(os.path.abspath(DB_PATH))
+    os.makedirs(folder, exist_ok=True)
+    with closing(get_conn()) as conn:
+        conn.execute("PRAGMA journal_mode = WAL")   # safer writes on a persistent disk
     with closing(get_conn()) as conn, conn:
         migrate(conn)
     return True
@@ -403,6 +524,202 @@ def get_flyer(event_id: int):
     with closing(get_conn()) as conn:
         row = conn.execute("SELECT flyer_bytes FROM events WHERE id = ?", (event_id,)).fetchone()
         return bytes(row["flyer_bytes"]) if row and row["flyer_bytes"] else None
+
+
+# ----- Prophet Masterclass -------------------------------------------------------
+MC_SESSION_COLUMNS = """s.id, s.session_name, s.session_type, s.active_status, s.streaming_url, s.session_date,
+                        s.price_note, s.created_at,
+                        (SELECT COUNT(*) FROM masterclass_registrations r WHERE r.session_id = s.id) AS registered,
+                        (SELECT COUNT(*) FROM masterclass_registrations r WHERE r.session_id = s.id
+                           AND r.payment_status = 'Pending Verification') AS pending,
+                        (SELECT COUNT(*) FROM masterclass_registrations r WHERE r.session_id = s.id
+                           AND r.payment_status IN ('Free Approved', 'Paid Approved')) AS approved,
+                        (SELECT COUNT(DISTINCT x.reg_id) FROM masterclass_entries x WHERE x.session_id = s.id)
+                           AS joined"""
+
+
+def mc_sessions(active_only: bool = False) -> list[dict]:
+    where = "WHERE s.active_status = 1" if active_only else ""
+    with closing(get_conn()) as conn:
+        rows = conn.execute(f"""SELECT {MC_SESSION_COLUMNS} FROM masterclass_sessions s {where}
+                                ORDER BY s.active_status DESC, COALESCE(s.session_date, date(s.created_at)) DESC,
+                                         s.id DESC""").fetchall()
+        return [dict(r) for r in rows]
+
+
+def mc_session(session_id: int):
+    with closing(get_conn()) as conn:
+        row = conn.execute(f"SELECT {MC_SESSION_COLUMNS} FROM masterclass_sessions s WHERE s.id = ?",
+                           (session_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def mc_create_session(name, session_type, streaming_url, session_date=None, price_note=None,
+                      active=True) -> int:
+    with closing(get_conn()) as conn, conn:
+        cur = conn.execute(
+            """INSERT INTO masterclass_sessions (session_name, session_type, active_status, streaming_url,
+                                                 session_date, price_note)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (name.strip(), session_type, int(active), (streaming_url or "").strip() or None, session_date,
+             (price_note or "").strip() or None))
+        return cur.lastrowid
+
+
+def mc_update_session(session_id, name, session_type, streaming_url, session_date, price_note, active):
+    with closing(get_conn()) as conn, conn:
+        conn.execute(
+            """UPDATE masterclass_sessions SET session_name = ?, session_type = ?, streaming_url = ?,
+                      session_date = ?, price_note = ?, active_status = ? WHERE id = ?""",
+            (name.strip(), session_type, (streaming_url or "").strip() or None, session_date,
+             (price_note or "").strip() or None, int(active), session_id))
+
+
+def mc_set_active(session_id: int, active: bool):
+    with closing(get_conn()) as conn, conn:
+        conn.execute("UPDATE masterclass_sessions SET active_status = ? WHERE id = ?", (int(active), session_id))
+
+
+def mc_delete_session(session_id: int) -> int:
+    with closing(get_conn()) as conn, conn:
+        n = conn.execute("DELETE FROM masterclass_registrations WHERE session_id = ?", (session_id,)).rowcount
+        conn.execute("DELETE FROM masterclass_entries WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM masterclass_sessions WHERE id = ?", (session_id,))
+        return n
+
+
+def new_reg_token(conn: sqlite3.Connection) -> str:
+    """IGNITE-8921 style. Four digits while there's room, then six."""
+    for attempt in range(60):
+        digits = 4 if attempt < 40 else 6
+        token = f"IGNITE-{secrets.randbelow(9 * 10 ** (digits - 1)) + 10 ** (digits - 1)}"
+        if not conn.execute("SELECT 1 FROM masterclass_registrations WHERE reg_id = ?", (token,)).fetchone():
+            return token
+    raise RuntimeError("Couldn't create a unique registration token.")
+
+
+def normalise_token(text: str) -> str:
+    t = re.sub(r"\s+", "", (text or "").upper())
+    if re.fullmatch(r"\d{4,6}", t):
+        t = "IGNITE-" + t
+    if re.fullmatch(r"IGNITE\d{4,6}", t):
+        t = "IGNITE-" + t[6:]
+    return t
+
+
+def mc_register(session: dict, full_name: str, email: str, phone: str) -> tuple[dict, bool]:
+    """Enrol someone. Returns (registration, is_new). The same phone number on the
+    same session gets its existing token back instead of a second one."""
+    status = MC_FREE if session["session_type"] == "Free" else MC_PENDING
+    with closing(get_conn()) as conn, conn:
+        row = conn.execute("SELECT * FROM masterclass_registrations WHERE session_id = ? AND phone = ?",
+                           (session["id"], phone)).fetchone()
+        if row:
+            return dict(row), False
+        token = new_reg_token(conn)
+        conn.execute(
+            """INSERT INTO masterclass_registrations (reg_id, session_id, full_name, email, phone, payment_status)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (token, session["id"], full_name.strip(), (email or "").strip() or None, phone, status))
+        row = conn.execute("SELECT * FROM masterclass_registrations WHERE reg_id = ?", (token,)).fetchone()
+        return dict(row), True
+
+
+def mc_lookup(entry: str, country: str = "Ghana") -> list[dict]:
+    """Find registrations on active sessions by token or phone number."""
+    token = normalise_token(entry)
+    sql = """SELECT r.*, s.session_name, s.session_type, s.streaming_url, s.session_date
+             FROM masterclass_registrations r JOIN masterclass_sessions s ON s.id = r.session_id
+             WHERE s.active_status = 1 AND {cond} ORDER BY r.created_at DESC"""
+    with closing(get_conn()) as conn:
+        if token.startswith("IGNITE-"):
+            rows = conn.execute(sql.format(cond="r.reg_id = ?"), (token,)).fetchall()
+        else:
+            phone = to_intl(entry, country)
+            if phone_problem(phone):
+                return []
+            rows = conn.execute(sql.format(cond="r.phone = ?"), (phone,)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def mc_log_entry(reg_id: str, session_id: int):
+    with closing(get_conn()) as conn, conn:
+        conn.execute("INSERT INTO masterclass_entries (reg_id, session_id) VALUES (?, ?)", (reg_id, session_id))
+
+
+def mc_set_status(reg_ids: list[str], status: str, actor: str) -> int:
+    assert status in (MC_FREE, MC_PENDING, MC_PAID)
+    with closing(get_conn()) as conn, conn:
+        n = 0
+        for rid in reg_ids:
+            n += conn.execute(
+                """UPDATE masterclass_registrations
+                   SET payment_status = ?, approved_by = CASE WHEN ? = 'Paid Approved' THEN ? ELSE NULL END,
+                       approved_at = CASE WHEN ? = 'Paid Approved' THEN CURRENT_TIMESTAMP ELSE NULL END
+                   WHERE reg_id = ?""", (status, status, actor, status, rid)).rowcount
+        return n
+
+
+def mc_delete_registration(reg_id: str):
+    with closing(get_conn()) as conn, conn:
+        conn.execute("DELETE FROM masterclass_entries WHERE reg_id = ?", (reg_id,))
+        conn.execute("DELETE FROM masterclass_registrations WHERE reg_id = ?", (reg_id,))
+
+
+def mc_registrations(session_id=None, status=None) -> pd.DataFrame:
+    cond, params = [], []
+    if session_id:
+        cond.append("r.session_id = ?")
+        params.append(session_id)
+    if status:
+        cond.append("r.payment_status = ?")
+        params.append(status)
+    where = ("WHERE " + " AND ".join(cond)) if cond else ""
+    return query_df(
+        f"""SELECT r.reg_id AS "Token", r.full_name AS "Full Name", r.phone AS "Phone",
+                   COALESCE(r.email, '') AS "Email", s.session_name AS "Session", s.session_type AS "Type",
+                   r.payment_status AS "Status",
+                   strftime('%Y-%m-%d %H:%M', r.created_at) AS "Registered (GMT)",
+                   COALESCE(r.approved_by, '') AS "Approved By",
+                   COALESCE(strftime('%Y-%m-%d %H:%M', r.approved_at), '') AS "Approved (GMT)",
+                   (SELECT COUNT(*) FROM masterclass_entries x WHERE x.reg_id = r.reg_id) AS "Room Entries",
+                   COALESCE((SELECT strftime('%Y-%m-%d %H:%M', MAX(x.entered_at)) FROM masterclass_entries x
+                             WHERE x.reg_id = r.reg_id), '') AS "Last Entry (GMT)"
+            FROM masterclass_registrations r JOIN masterclass_sessions s ON s.id = r.session_id
+            {where} ORDER BY r.created_at DESC""", params)
+
+
+# ----- Daily Google Meet prayer room -----------------------------------------------
+def meet_log(display_name: str, phone: str):
+    with closing(get_conn()) as conn, conn:
+        conn.execute(
+            """INSERT INTO google_meet_tracker (member_display_name, phone_number, tracking_date)
+               VALUES (?, ?, date('now'))""", (display_name.strip(), phone))
+
+
+def meet_attendance(day: str) -> pd.DataFrame:
+    return query_df(
+        """SELECT t.member_display_name AS "Meet Display Name", t.phone_number AS "Phone",
+                  COALESCE(m.full_name, '') AS "Member On File",
+                  strftime('%H:%M:%S', MIN(t.join_time)) AS "First Joined (GMT)",
+                  COUNT(*) AS "Times Joined"
+           FROM google_meet_tracker t LEFT JOIN members m ON m.phone_number = t.phone_number
+           WHERE t.tracking_date = ?
+           GROUP BY t.phone_number ORDER BY MIN(t.join_time)""", (day,))
+
+
+def meet_daily_totals(days: int = 30) -> pd.DataFrame:
+    return query_df(
+        """SELECT tracking_date AS "Date", COUNT(DISTINCT phone_number) AS "People"
+           FROM google_meet_tracker WHERE tracking_date >= date('now', ?)
+           GROUP BY tracking_date ORDER BY tracking_date""", (f"-{int(days)} days",))
+
+
+def meet_full_export() -> pd.DataFrame:
+    return query_df(
+        """SELECT tracking_date AS "Date", member_display_name AS "Meet Display Name", phone_number AS "Phone",
+                  strftime('%H:%M:%S', join_time) AS "Joined (GMT)"
+           FROM google_meet_tracker ORDER BY join_time DESC""")
 
 
 # ----- members ---------------------------------------------------------------
@@ -520,6 +837,14 @@ def member_history(member_id: int) -> pd.DataFrame:
 
 
 # ----- check-ins and pre-registrations ---------------------------------------
+def server_checkin_time(member_id: int, event_id: int) -> str:
+    """The arrival time exactly as the database recorded it."""
+    with closing(get_conn()) as conn:
+        row = conn.execute("""SELECT strftime('%H:%M:%S', check_in_timestamp) AS t FROM attendance
+                              WHERE member_id = ? AND event_id = ?""", (member_id, event_id)).fetchone()
+        return row["t"] if row else datetime.now(timezone.utc).strftime("%H:%M:%S")
+
+
 def record_check_in(member_id: int, event_id: int) -> bool:
     try:
         with closing(get_conn()) as conn, conn:
@@ -1102,11 +1427,11 @@ def make_poster(link: str, name: str, event_type: str, date_text: str, venue: st
     d = ImageDraw.Draw(img)
 
     d.rectangle([0, 0, W, 250], fill=INK)
-    d.rectangle([0, 250, W, 258], fill=GOLD)
+    d.rectangle([0, 250, W, 258], fill=POSTER_RED)
     _centre(d, W, 78, _spaced("Ignite"), load_font(58, serif=True), PAPER)
-    _centre(d, W, 158, _spaced("Prayer Network"), load_font(24), GOLD)
+    _centre(d, W, 158, _spaced("Prayer Network"), load_font(24), POSTER_RED)
 
-    _centre(d, W, 320, _spaced(heading), load_font(26, bold=True), ROYAL)
+    _centre(d, W, 320, _spaced(heading), load_font(26, bold=True), POSTER_RED)
     y = 380
     title_font = load_font(76, serif=True)
     for line in _wrap(d, name, title_font, W - 180)[:3]:
@@ -1115,7 +1440,7 @@ def make_poster(link: str, name: str, event_type: str, date_text: str, venue: st
     meta = "  ·  ".join(p for p in (event_type, date_text, venue) if p)
     meta_font = load_font(32)
     for line in _wrap(d, meta, meta_font, W - 220)[:2]:
-        _centre(d, W, y + 8, line, meta_font, MUTED)
+        _centre(d, W, y + 8, line, meta_font, POSTER_MUTED)
         y += 46
 
     size = 700
@@ -1126,7 +1451,7 @@ def make_poster(link: str, name: str, event_type: str, date_text: str, venue: st
     y += size + 90
 
     _centre(d, W, y, call_to_action, load_font(40, bold=True), INK)
-    _centre(d, W, y + 62, "Open your phone camera, point it at the code and tap the link.", load_font(27), MUTED)
+    _centre(d, W, y + 62, "Open your phone camera, point it at the code and tap the link.", load_font(27), POSTER_MUTED)
 
     d.rectangle([0, H - 92, W, H], fill=INK)
     _centre(d, W, H - 60, urlsplit(link).netloc, load_font(24), "#CFC6E3")
@@ -1155,136 +1480,261 @@ def inject_css(public: bool):
     st.markdown(
         f"""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@500;600;700&family=Manrope:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
 
-:root {{ --ink:{INK}; --royal:{ROYAL}; --royal-dark:{ROYAL_DARK}; --gold:{GOLD}; --gold-text:{GOLD_TEXT};
-        --flame:{FLAME}; --paper:{PAPER}; --sand:{SAND}; --line:{LINE}; --muted:{MUTED}; }}
-.stApp {{ background: var(--paper); color: var(--ink); }}
-.stApp, .stMarkdown, .stMarkdown p, .stMarkdown li, label, input, textarea, button p,
-[data-baseweb="select"] div, .stTabs button p, [data-testid="stMetricLabel"] p, .stCaption, small {{
-    font-family: 'Manrope', system-ui, -apple-system, 'Segoe UI', sans-serif; }}
+:root {{ --bg:#0b0d13; --surface:{SURFACE}; --text:#f3f4f6; --soft:#d6d9e0; --muted:#9aa1b0;
+        --red:{RED}; --red-dark:#9b050c; --glow:rgba(229,9,20,.4); --green:{GREEN}; --amber:{AMBER};
+        --glass:rgba(255,255,255,.03); --glass-2:rgba(255,255,255,.055); --line:rgba(255,255,255,.08);
+        --blur: blur(12px) saturate(160%); --shadow: 0 8px 32px 0 rgba(0,0,0,.37); --radius: 16px;
+        --sans: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+        --display: 'Inter', system-ui, -apple-system, sans-serif; }}
+
+/* ===== Global app canvas ===== */
+html, body {{ background:#0b0d13 !important; }}
+.stApp {{
+    background:
+      radial-gradient(1100px 620px at 100% -6%, rgba(229,9,20,.30), transparent 58%),
+      radial-gradient(760px 520px at -8% 18%, rgba(168,32,96,.16), transparent 62%),
+      radial-gradient(900px 700px at 50% 112%, rgba(70,90,200,.13), transparent 60%),
+      radial-gradient(circle at top right, #1a080a, #0b0d13 60%) !important;
+    background-attachment: fixed !important;
+    color: #f3f4f6 !important; font-family: var(--sans); }}
+/* slow light drift behind the glass, so the blur has something to catch */
+.stApp::before {{ content:""; position:fixed; inset:-20%; pointer-events:none; z-index:0;
+    background:
+      radial-gradient(420px 420px at 22% 30%, rgba(255,60,70,.10), transparent 70%),
+      radial-gradient(520px 520px at 78% 72%, rgba(255,140,90,.07), transparent 70%);
+    animation: igdrift 26s ease-in-out infinite alternate; }}
+@keyframes igdrift {{ from {{ transform: translate3d(-3%, -2%, 0) scale(1); }} to {{ transform: translate3d(4%, 3%, 0) scale(1.08); }} }}
+@media (prefers-reduced-motion: reduce) {{ .stApp::before {{ animation: none; }} }}
+[data-testid="stAppViewContainer"], [data-testid="stMain"] {{ background: transparent !important; position: relative; z-index: 1; }}
+
 .stApp p, .stApp label, .stApp input, .stApp textarea, .stApp button, .stApp li, .stApp td, .stApp th,
-.stApp [data-baseweb="select"] span:not([data-testid="stIconMaterial"]) {{
-    font-family: 'Manrope', system-ui, -apple-system, 'Segoe UI', sans-serif !important; }}
-.stApp .stMarkdown div, .stApp .stMarkdown span, .stApp [data-testid="stCaptionContainer"] {{
-    font-family: 'Manrope', system-ui, -apple-system, 'Segoe UI', sans-serif !important; }}
-.stApp .stMarkdown .ig-word, .stApp .stMarkdown .ig-h1, .stApp .stMarkdown .ig-ticket-date .d,
-.stApp .stMarkdown .ig-ticket-name, .stApp .stMarkdown .ig-formtitle, .stApp .stMarkdown .ig-serif,
-.stApp .stMarkdown .ig-serif *, .stApp .stMarkdown h1 *, .stApp .stMarkdown h2 *, .stApp .stMarkdown h3 *,
-.stApp .stMarkdown h4 * {{ font-family: 'Cormorant Garamond', Georgia, serif !important; }}
-.stApp [data-testid="stIconMaterial"], .stApp .stMarkdown [data-testid="stIconMaterial"],
-.stApp .stMarkdown h1 [data-testid="stIconMaterial"], .stApp .stMarkdown h2 [data-testid="stIconMaterial"],
-.stApp .stMarkdown h3 [data-testid="stIconMaterial"], .stApp .stMarkdown h4 [data-testid="stIconMaterial"],
-.stApp .stMarkdown span[role="img"][translate="no"], .stApp .stMarkdown h1 span[role="img"][translate="no"],
-.stApp .stMarkdown h2 span[role="img"][translate="no"], .stApp .stMarkdown h3 span[role="img"][translate="no"],
-.stApp .stMarkdown h4 span[role="img"][translate="no"] {{
+.stApp .stMarkdown div, .stApp .stMarkdown span, .stApp [data-testid="stCaptionContainer"],
+.stApp [data-baseweb="select"] span:not([data-testid="stIconMaterial"]) {{ font-family: var(--sans) !important; }}
+.stApp p, .stApp li, .stApp label, .stApp .stMarkdown {{ color: var(--soft); }}
+.stApp label p {{ color: #e5e7eb !important; font-weight: 600; font-size: .86rem; }}
+.stApp [data-testid="stCaptionContainer"], .stApp [data-testid="stCaptionContainer"] p {{ color: var(--muted) !important; }}
+h1, h2, h3, h4, .ig-display, .stApp .stMarkdown h1 *, .stApp .stMarkdown h2 *, .stApp .stMarkdown h3 *,
+.stApp .stMarkdown h4 *, .stApp .stMarkdown .ig-word, .stApp .stMarkdown .ig-h1, .stApp .stMarkdown .ig-formtitle,
+.stApp .stMarkdown .ig-ticket-name, .stApp .stMarkdown .ig-ticket-date .d, .stApp .stMarkdown .ig-token,
+.stApp .stMarkdown .ig-done h2, [data-testid="stMetricValue"] {{
+    font-family: var(--display) !important; color: #ffffff !important; letter-spacing: -.025em;
+    font-variant-numeric: lining-nums tabular-nums; }}
+h1, h2, h3, h4 {{ font-weight: 700 !important; }}
+.stApp [data-testid="stIconMaterial"], .stApp span[role="img"][translate="no"],
+.stApp .stMarkdown span[role="img"][translate="no"] {{
     font-family: 'Material Symbols Rounded' !important; font-weight: 400 !important; }}
-.ig-word, .ig-h1, .ig-ticket-date .d, .ig-ticket-name, .ig-formtitle, [data-testid="stMetricValue"],
-h1, h2, h3, h4, .ig-serif {{ font-variant-numeric: lining-nums; }}
-h1, h2, h3, h4, .ig-serif {{ font-family: 'Cormorant Garamond', Georgia, 'Times New Roman', serif !important;
-    font-weight: 600 !important; letter-spacing: 0; color: var(--ink); }}
-#MainMenu, footer, [data-testid="stToolbar"], [data-testid="stDecoration"] {{ visibility: hidden; }}
-header[data-testid="stHeader"] {{ background: transparent; }}
-.block-container {{ max-width: {width}; padding-top: 1.4rem; padding-bottom: 3rem; }}
+a, .stApp .stMarkdown a {{ color: #ff5a63; }}
+
+/* ===== Hide default Streamlit clutter ===== */
+#MainMenu, footer, header, [data-testid="stToolbar"], [data-testid="stDecoration"], [data-testid="stStatusWidget"] {{ visibility: hidden; }}
+header[data-testid="stHeader"] {{ background: transparent; height: 0; }}
+.block-container {{ max-width: {width}; padding-top: 1.6rem; padding-bottom: 3rem; }}
+hr {{ border-color: var(--line) !important; }}
+
+/* ===== Sidebar custom glass look ===== */
+[data-testid="stSidebar"] {{ background-color: rgba(11,13,19,.85) !important; backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px); border-right: 1px solid rgba(255,255,255,.05); }}
+
+/* ===== Frosted glass content cards =====
+   Cards are attached to named containers (key="glass_...") and to forms, so a
+   card never ends up nested inside another card. */
+[data-testid="stForm"], [class*="st-key-glass"], [data-testid="stExpander"] details, [data-testid="stMetric"],
+.ig-glass, .ig-ticket, .ig-note, .ig-done, .ig-deny, .ig-tokencard, .ig-row {{
+    background: linear-gradient(180deg, rgba(255,255,255,.055) 0%, rgba(255,255,255,.03) 38%, rgba(255,255,255,.025) 100%) !important;
+    -webkit-backdrop-filter: var(--blur); backdrop-filter: var(--blur);
+    border: 1px solid rgba(255,255,255,.08) !important; border-radius: var(--radius) !important;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,.07), 0 8px 32px 0 rgba(0,0,0,.37); }}
+[data-testid="stForm"] {{ padding: 25px 22px 22px; margin-bottom: 20px; }}
+[class*="st-key-glass"] {{ padding: 25px; margin-bottom: 20px; }}
+[class*="st-key-glass_pa_"] {{ padding: 16px 20px; margin-bottom: 10px; }}
+/* inside a big panel, the smaller cards turn into soft insets instead of more cards */
+[class*="st-key-glass_panel"] [data-testid="stForm"], [class*="st-key-glass_panel"] [data-testid="stMetric"],
+[class*="st-key-glass_panel"] [data-testid="stExpander"] details, [class*="st-key-glass_panel"] [class*="st-key-glass_"]:not([class*="st-key-glass_panel"]) {{
+    background: rgba(255,255,255,.028) !important; box-shadow: inset 0 1px 0 rgba(255,255,255,.04) !important;
+    -webkit-backdrop-filter: none; backdrop-filter: none; }}
+[class*="st-key-glass_panel"] {{ padding: 26px 28px; }}
+.st-key-glass_topbar {{ padding: 14px 20px !important; margin-bottom: 18px !important; }}
+.st-key-glass_topbar .ig-brand {{ margin:0 !important; }}
+.stTabs [data-baseweb="tab-panel"] {{ padding-top: 1.1rem; }}
+[data-testid="stExpander"] summary p {{ color: #ffffff !important; font-weight: 600; }}
+
+/* ===== Premium inputs ===== */
+.stTextInput input, .stSelectbox div[data-baseweb="select"], .stNumberInput input, .stDateInput input, .stTextArea textarea {{
+    background-color: rgba(255,255,255,.05) !important; color: #ffffff !important; backdrop-filter: blur(4px); }}
+[data-baseweb="input"], [data-baseweb="base-input"], [data-baseweb="textarea"], .stSelectbox div[data-baseweb="select"] > div {{
+    background-color: rgba(255,255,255,.05) !important; border: 1px solid rgba(255,255,255,.1) !important;
+    border-radius: 8px !important; }}
+[data-baseweb="input"] > div, [data-baseweb="base-input"] {{ background-color: transparent !important; border: none !important; }}
+[data-baseweb="input"] input, [data-baseweb="textarea"] textarea, [data-baseweb="select"] span {{
+    color: #ffffff !important; font-size: 1rem !important; -webkit-text-fill-color: #ffffff; }}
+[data-baseweb="input"] input::placeholder, textarea::placeholder {{ color: #6b7280 !important; -webkit-text-fill-color: #6b7280; }}
+[data-baseweb="input"]:focus-within, .stSelectbox div[data-baseweb="select"] > div:focus-within, [data-baseweb="textarea"]:focus-within {{
+    border-color: rgba(229,9,20,.85) !important; box-shadow: 0 0 0 3px rgba(229,9,20,.2), 0 0 18px rgba(229,9,20,.18) !important; }}
+[data-baseweb="popover"] ul, [data-baseweb="menu"] {{ background: rgba(20,22,30,.96) !important; backdrop-filter: blur(16px); }}
+[data-baseweb="checkbox"] span {{ border-color: rgba(255,255,255,.3); }}
+[data-testid="stFileUploaderDropzone"] {{ background: rgba(255,255,255,.04) !important;
+    border: 1px dashed rgba(255,255,255,.18) !important; border-radius: 12px; }}
+
+/* ===== Glowing Ignite red buttons ===== */
+div.stButton > button, div.stFormSubmitButton > button, div.stDownloadButton > button, div.stLinkButton > a {{
+    border-radius: 8px !important; font-weight: 600 !important; min-height: 3rem; letter-spacing: .5px;
+    padding: 12px 24px !important; transition: all .3s ease !important; }}
+[data-testid="stBaseButton-primary"], [data-testid="stBaseButton-primaryFormSubmit"], a[data-testid="stBaseLinkButton-primary"] {{
+    background: linear-gradient(135deg, #e50914 0%, #9b050c 100%) !important; color: #ffffff !important;
+    border: none !important; box-shadow: 0 4px 15px rgba(229,9,20,.4) !important; }}
+[data-testid="stBaseButton-primary"] p, [data-testid="stBaseButton-primaryFormSubmit"] p,
+a[data-testid="stBaseLinkButton-primary"] p {{ color: #fff !important; font-weight: 600 !important; }}
+[data-testid="stBaseButton-primary"]:hover, [data-testid="stBaseButton-primaryFormSubmit"]:hover,
+a[data-testid="stBaseLinkButton-primary"]:hover {{
+    transform: translateY(-2px); background: linear-gradient(135deg, #ff1a25 0%, #b80710 100%) !important;
+    box-shadow: 0 6px 20px rgba(229,9,20,.6) !important; }}
+[data-testid="stBaseButton-secondary"], [data-testid="stBaseButton-secondaryFormSubmit"],
+a[data-testid="stBaseLinkButton-secondary"], div.stDownloadButton > button {{
+    background: rgba(255,255,255,.05) !important; border: 1px solid rgba(255,255,255,.14) !important; color: var(--text) !important;
+    backdrop-filter: blur(6px); }}
+[data-testid="stBaseButton-secondary"] p, a[data-testid="stBaseLinkButton-secondary"] p, div.stDownloadButton p {{ color: var(--text) !important; }}
+[data-testid="stBaseButton-secondary"]:hover, a[data-testid="stBaseLinkButton-secondary"]:hover {{
+    border-color: rgba(229,9,20,.6) !important; }}
+[data-testid="stBaseButton-tertiary"] p {{ color: #FF5A63 !important; font-weight: 600; }}
+.st-key-wa_btn a, [class*="st-key-wa_"] a {{
+    background: linear-gradient(180deg, #2BE07A 0%, #1DAA5B 100%) !important; border: 1px solid rgba(120,255,170,.35) !important;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,.25), 0 10px 26px -8px rgba(34,197,94,.65) !important; }}
+.st-key-wa_btn a p, [class*="st-key-wa_"] a p {{ color: #06240F !important; font-weight: 800 !important; }}
 
 /* ---- brand ---- */
 .ig-brand {{ display:flex; align-items:center; gap:.75rem; margin:.4rem 0 1.5rem; }}
-.ig-mark {{ width:42px; height:42px; border-radius:50%; flex:none; display:flex; align-items:center; justify-content:center;
-           background: radial-gradient(circle at 50% 35%, #3A2E5C 0%, var(--ink) 70%); color:var(--flame);
-           box-shadow: 0 0 0 3px rgba(201,162,75,.28); }}
+.ig-mark {{ width:42px; height:42px; border-radius:13px; flex:none; display:flex; align-items:center; justify-content:center;
+           background: linear-gradient(160deg, #FF2B36 0%, var(--red) 45%, #7A040A 100%); color:#fff;
+           box-shadow: 0 0 0 1px rgba(255,255,255,.12) inset, 0 8px 24px -6px var(--glow); }}
 .ig-flame {{ width:15px; height:19px; }}
-.ig-word {{ font-family:'Cormorant Garamond', Georgia, serif; font-size:1.55rem; font-weight:700; line-height:1; color:var(--ink); }}
-.ig-word-sub {{ font-size:.64rem; font-weight:600; letter-spacing:.26em; text-transform:uppercase; color:var(--gold-text); margin-top:.3rem; }}
+.ig-word {{ font-family: var(--display); font-size:1.35rem; font-weight:800; line-height:1; color:var(--text); }}
+.ig-word-sub {{ font-size:.62rem; font-weight:700; letter-spacing:.28em; text-transform:uppercase; color:var(--muted); margin-top:.35rem; }}
 .ig-center {{ justify-content:center; }}
-
-.ig-kicker {{ font-size:.72rem; font-weight:700; letter-spacing:.2em; text-transform:uppercase; color:var(--royal); }}
-.ig-h1 {{ font-family:'Cormorant Garamond', Georgia, serif; font-size:2.35rem; line-height:1.08; font-weight:600;
-         color:var(--ink); margin:.3rem 0 .5rem; }}
-.ig-lead {{ color:var(--muted); font-size:.98rem; line-height:1.6; margin-bottom:1.1rem; }}
+.ig-kicker {{ font-size:.7rem; font-weight:800; letter-spacing:.22em; text-transform:uppercase; color:#FF4D57; }}
+.ig-h1 {{ font-family: var(--display); font-size:2.15rem; line-height:1.1; font-weight:800; color:var(--text);
+         margin:.35rem 0 .55rem; letter-spacing:-.02em; }}
+.ig-lead {{ color:var(--soft); font-size:.98rem; line-height:1.6; margin-bottom:1.1rem; }}
 
 /* ---- flyer ---- */
-.st-key-flyer_banner img {{ width:100%; max-height:56vh; object-fit:contain; border-radius:16px;
-    box-shadow:0 20px 44px -24px rgba(31,26,51,.6); }}
+.st-key-flyer_banner img {{ width:100%; max-height:56vh; object-fit:contain; border-radius:18px;
+    box-shadow: 0 24px 60px -24px rgba(0,0,0,.9), 0 0 0 1px rgba(255,255,255,.08); }}
 
 /* ---- event ticket ---- */
-.ig-ticket {{ display:grid; grid-template-columns:86px 1fr; background:#fff; border:1px solid var(--line);
-             border-radius:16px; overflow:hidden; margin:.2rem 0 1.3rem; box-shadow:0 1px 0 rgba(31,26,51,.04); }}
-.ig-ticket-date {{ background:linear-gradient(170deg, #2C2450 0%, var(--ink) 100%); color:var(--paper);
+.ig-ticket {{ display:grid; grid-template-columns:84px 1fr; overflow:hidden; margin:.2rem 0 1.3rem; padding:0 !important; }}
+.ig-ticket-date {{ background: linear-gradient(170deg, rgba(229,9,20,.9) 0%, #6E0309 100%); color:#fff;
                   display:flex; flex-direction:column; align-items:center; justify-content:center; padding:.8rem .3rem; }}
-.ig-ticket-date .m {{ font-size:.64rem; font-weight:600; letter-spacing:.22em; color:#CFC6E3; }}
-.ig-ticket-date .d {{ font-family:'Cormorant Garamond', Georgia, serif; font-size:2.3rem; font-weight:700; line-height:1; color:#fff; }}
-.ig-ticket-date .w {{ font-size:.64rem; font-weight:600; letter-spacing:.22em; color:var(--gold); }}
-.ig-ticket-date .ig-flame {{ width:20px; height:26px; color:var(--flame); }}
-.ig-ticket-body {{ padding:.95rem 1.1rem; border-left:2px dashed var(--line); }}
-.ig-ticket-type {{ font-size:.64rem; font-weight:700; letter-spacing:.2em; text-transform:uppercase; }}
-.ig-ticket-name {{ font-family:'Cormorant Garamond', Georgia, serif; font-size:1.5rem; font-weight:700; line-height:1.15;
-                  margin:.2rem 0 .3rem; color:var(--ink); }}
+.ig-ticket-date .m {{ font-size:.62rem; font-weight:700; letter-spacing:.22em; color:rgba(255,255,255,.8); }}
+.ig-ticket-date .d {{ font-family: var(--display); font-size:2.1rem; font-weight:700; line-height:1.05; color:#fff; }}
+.ig-ticket-date .w {{ font-size:.62rem; font-weight:700; letter-spacing:.22em; color:rgba(255,255,255,.8); }}
+.ig-ticket-date .ig-flame {{ width:20px; height:26px; color:#fff; }}
+.ig-ticket-body {{ padding:.95rem 1.1rem; border-left:1px dashed rgba(255,255,255,.14); }}
+.ig-ticket-type {{ font-size:.62rem; font-weight:800; letter-spacing:.2em; text-transform:uppercase; }}
+.ig-ticket-name {{ font-family: var(--display); font-size:1.3rem; font-weight:700; line-height:1.2; margin:.25rem 0 .3rem; color:var(--text); }}
 .ig-ticket-venue {{ color:var(--muted); font-size:.88rem; }}
 .ig-ico {{ width:.95rem; height:.95rem; vertical-align:-2px; margin-right:.3rem; }}
 
-/* ---- forms ---- */
-[data-testid="stForm"] {{ background:#fff; border:1px solid var(--line) !important; border-radius:18px;
-                          padding:1.3rem 1.2rem 1.1rem; box-shadow:0 12px 30px -26px rgba(31,26,51,.45); }}
-.ig-step {{ font-size:.7rem; font-weight:700; letter-spacing:.18em; text-transform:uppercase; color:var(--gold-text); margin-bottom:.4rem; }}
-.ig-formtitle {{ font-family:'Cormorant Garamond', Georgia, serif; font-size:1.55rem; font-weight:700; color:var(--ink); margin-bottom:.15rem; }}
-.ig-formnote {{ color:var(--muted); font-size:.9rem; line-height:1.55; margin-bottom:.4rem; }}
-.ig-section {{ font-size:.68rem; font-weight:700; letter-spacing:.18em; text-transform:uppercase; color:var(--royal);
-              margin:1rem 0 .1rem; padding-top:.85rem; border-top:1px solid var(--line); }}
-.ig-chip {{ display:inline-flex; align-items:center; gap:.2rem; background:#fff; border:1px solid var(--line);
-           border-radius:999px; padding:.4rem .85rem; font-size:.92rem; font-weight:600; color:var(--ink); margin:.1rem 0 .5rem; }}
-.ig-chip .ig-ico {{ color:var(--royal); }}
-.ig-note {{ background:#fff; border:1px solid var(--line); border-left:3px solid var(--gold); border-radius:0 12px 12px 0;
-           padding:.75rem .95rem; font-size:.9rem; color:var(--ink); margin:.4rem 0 1rem; line-height:1.55; }}
-[data-baseweb="input"] input, [data-baseweb="select"] > div {{ font-size:.98rem; }}
-
-/* ---- buttons ---- */
-div.stButton > button, div.stFormSubmitButton > button, div.stDownloadButton > button, div.stLinkButton > a {{
-    border-radius:12px; font-weight:700; min-height:3rem; letter-spacing:.01em; }}
-[data-testid="stBaseButton-primary"], [data-testid="stBaseButton-primaryFormSubmit"] {{
-    background:var(--royal) !important; border-color:var(--royal) !important; color:#fff !important;
-    box-shadow:0 10px 22px -14px rgba(75,46,131,.9); }}
-[data-testid="stBaseButton-primary"]:hover, [data-testid="stBaseButton-primaryFormSubmit"]:hover {{
-    background:var(--royal-dark) !important; border-color:var(--royal-dark) !important; }}
-[data-testid="stBaseButton-secondary"], [data-testid="stBaseButton-secondaryFormSubmit"] {{
-    background:#fff; border-color:var(--line); color:var(--ink); }}
-[data-testid="stBaseButton-tertiary"] p {{ color:var(--royal); font-weight:600; }}
-
-/* ---- confirmation ---- */
-.ig-done {{ background: radial-gradient(120% 90% at 50% 0%, #3A2E66 0%, var(--ink) 62%); color:var(--paper);
-           border-radius:24px; padding:2.4rem 1.6rem 1.9rem; text-align:center; margin:.4rem 0 1rem;
-           box-shadow:0 26px 54px -30px rgba(31,26,51,.9); }}
-.ig-done-seal {{ width:76px; height:76px; margin:0 auto 1.1rem; border-radius:50%; background:var(--gold);
-                color:var(--ink); display:flex; align-items:center; justify-content:center;
-                box-shadow:0 0 0 8px rgba(201,162,75,.18); }}
-.ig-done-info .ig-done-seal {{ background:#CFC6E3; }}
-.ig-done-seal svg {{ width:40px; height:40px; }}
-.ig-done-kicker {{ font-size:.7rem; letter-spacing:.24em; text-transform:uppercase; color:var(--gold); font-weight:700; }}
-.ig-done h2 {{ color:#fff !important; font-size:2.1rem; margin:.4rem 0 .6rem; padding:0; }}
-.ig-done p {{ color:#D9D3E6; font-size:.98rem; line-height:1.65; max-width:26rem; margin:0 auto; }}
-.ig-done-meta {{ margin-top:1.4rem; padding-top:1rem; border-top:1px solid rgba(255,255,255,.12);
-                font-size:.78rem; color:#A79FBD; }}
+/* ---- form text ---- */
+.ig-step {{ font-size:.68rem; font-weight:800; letter-spacing:.2em; text-transform:uppercase; color:#FF4D57; margin-bottom:.4rem; }}
+.ig-formtitle {{ font-family: var(--display); font-size:1.3rem; font-weight:700; color:var(--text); margin-bottom:.2rem; }}
+.ig-formnote {{ color:var(--muted); font-size:.9rem; line-height:1.55; margin-bottom:.5rem; }}
+.ig-section {{ font-size:.66rem; font-weight:800; letter-spacing:.2em; text-transform:uppercase; color:#FF4D57;
+              margin:1rem 0 .15rem; padding-top:.85rem; border-top:1px solid var(--line); }}
+.ig-chip {{ display:inline-flex; align-items:center; gap:.2rem; background:rgba(255,255,255,.06); border:1px solid var(--line);
+           border-radius:999px; padding:.4rem .85rem; font-size:.92rem; font-weight:700; color:var(--text); margin:.1rem 0 .5rem; }}
+.ig-chip .ig-ico {{ color:var(--red); }}
+.ig-note {{ border-left:3px solid var(--red) !important; border-radius:6px 14px 14px 6px; padding:.8rem 1rem;
+           font-size:.9rem; color:var(--soft); margin:.4rem 0 1rem; line-height:1.55; }}
 .ig-muted {{ text-align:center; color:var(--muted); font-size:.82rem; }}
+
+/* ---- confirmation / privacy wipe ---- */
+.ig-done {{ padding:2.3rem 1.5rem 1.8rem; text-align:center; margin:.4rem 0 1rem; border-radius:24px !important;
+           background: radial-gradient(120% 90% at 50% 0%, rgba(229,9,20,.20) 0%, rgba(255,255,255,.04) 60%) !important; }}
+.ig-done.ig-done-success {{ background: radial-gradient(120% 90% at 50% 0%, rgba(34,197,94,.28) 0%, rgba(255,255,255,.04) 62%) !important;
+           border-color: rgba(34,197,94,.45) !important; box-shadow: 0 0 0 1px rgba(34,197,94,.15), 0 0 60px -10px rgba(34,197,94,.45), var(--shadow) !important; }}
+.ig-done-seal {{ width:76px; height:76px; margin:0 auto 1.1rem; border-radius:50%; display:flex; align-items:center; justify-content:center;
+                background: linear-gradient(160deg, #FF2B36, #8A050C); color:#fff; box-shadow:0 0 0 8px rgba(229,9,20,.14); }}
+.ig-done-success .ig-done-seal {{ background: linear-gradient(160deg, #3BE584, #129447); color:#03210E;
+                                  box-shadow:0 0 0 8px rgba(34,197,94,.16), 0 0 40px rgba(34,197,94,.5); }}
+.ig-done-info .ig-done-seal {{ background: rgba(255,255,255,.12); color: var(--text); box-shadow:0 0 0 8px rgba(255,255,255,.05); }}
+.ig-done-seal svg {{ width:40px; height:40px; }}
+.ig-done-kicker {{ font-size:.68rem; letter-spacing:.24em; text-transform:uppercase; color:var(--muted); font-weight:800; }}
+.ig-done-success .ig-done-kicker {{ color: #5BE89A; }}
+.ig-done h2 {{ color:#fff !important; font-size:1.75rem !important; margin:.45rem 0 .6rem; padding:0; }}
+.ig-done p {{ color:var(--soft); font-size:.97rem; line-height:1.65; max-width:26rem; margin:0 auto; }}
+.ig-done-meta {{ margin-top:1.3rem; padding-top:1rem; border-top:1px solid var(--line); font-size:.78rem; color:var(--muted); }}
+.ig-bar {{ height:3px; border-radius:3px; background: rgba(255,255,255,.08); overflow:hidden; margin: .9rem auto 0; max-width: 16rem; }}
+.ig-bar i {{ display:block; height:100%; background: var(--green); animation: igdrain var(--secs) linear forwards; }}
+@keyframes igdrain {{ from {{ width:100%; }} to {{ width:0%; }} }}
+
+/* ---- error card ---- */
+.ig-deny {{ padding:1.5rem 1.3rem; text-align:center; margin:.6rem 0 1rem; border-color: rgba(229,9,20,.45) !important;
+           background: radial-gradient(120% 100% at 50% 0%, rgba(229,9,20,.22), rgba(255,255,255,.035) 65%) !important;
+           box-shadow: 0 0 50px -14px rgba(229,9,20,.55), var(--shadow) !important; }}
+.ig-deny-icon {{ width:54px; height:54px; border-radius:50%; margin:0 auto .8rem; display:flex; align-items:center; justify-content:center;
+                background: rgba(229,9,20,.16); color:#FF5A63; border:1px solid rgba(229,9,20,.5); }}
+.ig-deny-icon svg {{ width:26px; height:26px; }}
+.ig-deny h3 {{ font-size:1.25rem !important; margin:0 0 .4rem; padding:0; }}
+.ig-deny p {{ margin:0 auto; max-width:24rem; font-size:.93rem; line-height:1.6; color:var(--soft); }}
+.ig-deny.ig-wait {{ border-color: rgba(245,184,65,.45) !important;
+           background: radial-gradient(120% 100% at 50% 0%, rgba(245,184,65,.18), rgba(255,255,255,.035) 65%) !important;
+           box-shadow: 0 0 50px -14px rgba(245,184,65,.45), var(--shadow) !important; }}
+.ig-wait .ig-deny-icon {{ background: rgba(245,184,65,.14); color: var(--amber); border-color: rgba(245,184,65,.5); }}
+
+/* ---- token ---- */
+.ig-tokencard {{ padding:1.6rem 1.3rem 1.4rem; text-align:center; margin:.4rem 0 1rem; border-radius:24px !important; }}
+.ig-token {{ font-family: var(--display); font-size:2.3rem; font-weight:800; letter-spacing:.04em; color:#fff;
+            margin:.5rem 0 .3rem; text-shadow: 0 0 28px rgba(229,9,20,.55); }}
+.ig-status {{ display:inline-block; font-size:.68rem; font-weight:800; letter-spacing:.16em; text-transform:uppercase;
+             padding:.32rem .75rem; border-radius:999px; margin-top:.3rem; }}
+.ig-status-ok {{ background: rgba(34,197,94,.14); color:#5BE89A; border:1px solid rgba(34,197,94,.45); }}
+.ig-status-wait {{ background: rgba(245,184,65,.12); color: var(--amber); border:1px solid rgba(245,184,65,.45); }}
+.ig-tokencard p {{ color:var(--soft); font-size:.93rem; line-height:1.6; max-width:25rem; margin:.8rem auto 0; }}
 
 /* ---- footer (doubles as the quiet admin entrance) ---- */
 .st-key-ig_footer_btn, .st-key-ig_footer_btn [data-testid="stButton"], .st-key-ig_footer_btn .stButton {{
     display:flex; justify-content:center; width:100%; }}
-.st-key-ig_footer_btn button {{ min-height:auto !important; padding:.2rem .5rem; background:transparent !important;
+.st-key-ig_footer_btn > div, .st-key-ig_footer_btn [data-testid="stElementContainer"] {{ width:100% !important;
+    display:flex !important; justify-content:center !important; }}
+.st-key-ig_footer_btn button {{ margin:0 auto; min-height:auto !important; padding:.2rem .5rem; background:transparent !important;
                                border:none !important; cursor:default; box-shadow:none !important; }}
-.st-key-ig_footer_btn button p {{ font-size:.76rem !important; font-weight:500 !important; letter-spacing:.06em;
-                                 color:var(--muted) !important; }}
-.st-key-ig_scroll {{ display:none; }}
+.st-key-ig_footer_btn button p {{ font-size:.74rem !important; font-weight:500 !important; letter-spacing:.06em;
+                                 color:#5D6577 !important; }}
+.st-key-ig_scroll, .st-key-ig_go {{ display:none; }}
 
 /* ---- admin ---- */
-.ig-pill {{ font-family:'Manrope', sans-serif; font-size:.6rem; font-weight:700; letter-spacing:.18em; text-transform:uppercase;
-           border:1px solid var(--gold); color:var(--gold-text); border-radius:999px; padding:.2rem .55rem;
-           margin-left:.5rem; vertical-align:middle; }}
-[data-testid="stMetric"] {{ background:#fff; border:1px solid var(--line); border-radius:14px; padding:.85rem 1rem; }}
-[data-testid="stMetricValue"] {{ font-family:'Cormorant Garamond', Georgia, serif; font-weight:700; color:var(--ink); }}
-[data-baseweb="tab-highlight"] {{ background-color:var(--royal); }}
-.stTabs [aria-selected="true"] p {{ color:var(--royal); font-weight:700; }}
-[data-testid="stExpander"] details {{ background:#fff; border-color:var(--line); border-radius:14px; }}
-.ig-badge {{ display:inline-block; color:#fff; font-size:.64rem; font-weight:700; letter-spacing:.14em;
+.ig-pill {{ font-family: var(--sans); font-size:.58rem; font-weight:800; letter-spacing:.18em; text-transform:uppercase;
+           background: rgba(229,9,20,.14); border:1px solid rgba(229,9,20,.55); color:#FF5A63; border-radius:999px;
+           padding:.22rem .55rem; margin-left:.5rem; vertical-align:middle; }}
+[data-testid="stMetric"] {{ padding:.9rem 1rem; }}
+[data-testid="stMetricLabel"] p {{ color: var(--muted) !important; font-weight:700 !important; font-size:.78rem !important;
+    letter-spacing:.04em; }}
+[data-testid="stMetricValue"] {{ font-weight:700 !important; }}
+.stTabs [data-baseweb="tab-list"] {{ gap:.25rem; border-bottom:1px solid var(--line); flex-wrap: wrap; }}
+.stTabs [data-baseweb="tab"] p {{ color: var(--muted) !important; font-weight:600; }}
+.stTabs [aria-selected="true"] p {{ color: #fff !important; font-weight:800; }}
+[data-baseweb="tab-highlight"] {{ background-color: var(--red) !important; box-shadow: 0 0 12px var(--glow); }}
+[data-baseweb="tab-border"] {{ background: transparent !important; }}
+[data-testid="stDataFrame"], [data-testid="stTable"] {{ border:1px solid var(--line); border-radius:14px; overflow:hidden; }}
+[data-testid="stAlert"] {{ border-radius:14px; -webkit-backdrop-filter: var(--blur); backdrop-filter: var(--blur); }}
+.stCode, [data-testid="stCode"] pre {{ background: rgba(255,255,255,.05) !important; border-radius:12px; }}
+.ig-badge {{ display:inline-block; color:#fff; font-size:.62rem; font-weight:800; letter-spacing:.14em;
             text-transform:uppercase; padding:.2rem .55rem; border-radius:999px; }}
+.ig-row {{ padding:.85rem 1rem; margin:.15rem 0; border-radius:14px !important; }}
+.ig-row b {{ color: var(--text); }}
+.ig-rowmeta {{ color: var(--muted); font-size:.84rem; margin-top:.2rem; }}
+[class*="st-key-glass_pa_"] code {{ color:#ff8a91 !important; background: rgba(229,9,20,.12) !important; border-radius:6px; padding:.1rem .4rem; }}
+.ig-row code {{ color:#FF7A82; background: rgba(229,9,20,.1); border-radius:6px; padding:.05rem .35rem; }}
+
+@media (max-width: 640px) {{
+  .block-container {{ padding-left: 1rem; padding-right: 1rem; padding-top: .8rem; }}
+  .ig-h1 {{ font-size: 1.7rem; }}
+  .ig-token {{ font-size: 1.95rem; }}
+  [data-testid="stForm"] {{ padding: 1.1rem .95rem .95rem; }}
+  .ig-done {{ padding: 2rem 1.1rem 1.5rem; }}
+  [data-testid="stHorizontalBlock"] {{ gap: .5rem; }}
+}}
 </style>
         """,
         unsafe_allow_html=True,
@@ -1311,7 +1761,7 @@ def page_heading(kicker: str, title: str, lead: str = ""):
 
 
 def event_ticket(ev: dict, public: bool = True):
-    colour = TYPE_COLOURS.get(ev["event_type"], EMBER)
+    colour = TYPE_COLOURS.get(ev["event_type"], RED)
     type_name = PUBLIC_TYPE_NAMES.get(ev["event_type"], ev["event_type"]) if public else ev["event_type"]
     if ev.get("event_date"):
         try:
@@ -1528,13 +1978,14 @@ def reset_flow_state():
 
 
 def confirm_and_reset(kind: str, title: str, message: str, context: str,
-                      auto_reset: bool = True, link: tuple | None = None):
+                      auto_reset: bool = True, link: tuple | None = None, seconds: int = CONFIRM_SECONDS,
+                      stamp: str | None = None):
     """Show the confirmation screen, throw away the form and anything the
     person typed (a new form counter means brand-new, empty widgets)."""
     st.session_state.confirmation = {
         "kind": kind, "title": title, "message": message, "context": context,
-        "time": datetime.now(timezone.utc).strftime("%H:%M"), "shown_at": None,
-        "auto_reset": auto_reset, "link": link,
+        "time": stamp or datetime.now(timezone.utc).strftime("%H:%M:%S"), "shown_at": None,
+        "auto_reset": auto_reset, "link": link, "seconds": seconds,
     }
     reset_flow_state()
     st.session_state.form_nonce += 1
@@ -1565,14 +2016,17 @@ def show_confirmation() -> bool:
     if c["shown_at"] is None:
         c["shown_at"] = time.time()
     brand_row(center=True)
-    seal, css = (ICON_CHECK, "ig-done") if c["kind"] == "success" else (ICON_INFO, "ig-done ig-done-info")
+    seal, css = (ICON_CHECK, "ig-done ig-done-success") if c["kind"] == "success" else (ICON_INFO, "ig-done ig-done-info")
+    secs = c.get("seconds", CONFIRM_SECONDS)
+    bar = f'<div class="ig-bar" style="--secs:{secs}s"><i></i></div>' if c.get("auto_reset") else ""
     st.markdown(
         f"""<div class="{css}">
               <div class="ig-done-seal">{seal}</div>
               <div class="ig-done-kicker">Submitted · thank you</div>
               <h2>{esc(c['title'])}</h2>
               <p>{esc(c['message'])}</p>
-              <div class="ig-done-meta">{esc(c['context'])} &nbsp;·&nbsp; recorded {c['time']} GMT</div>
+              <div class="ig-done-meta">{esc(c['context'])} &nbsp;·&nbsp; recorded {esc(c['time'])} GMT (server time)</div>
+              {bar}
             </div>""",
         unsafe_allow_html=True,
     )
@@ -1587,7 +2041,7 @@ def show_confirmation() -> bool:
     if c.get("auto_reset"):
         @st.fragment(run_every=1)
         def countdown():
-            left = CONFIRM_SECONDS - int(time.time() - c["shown_at"])
+            left = secs - int(time.time() - c["shown_at"])
             if left <= 0:
                 st.session_state.pop("confirmation", None)
                 st.rerun(scope="app")
@@ -1774,10 +2228,12 @@ def complete_checkin(member_id: int, ev: dict, is_new: bool):
             msg = "You registered ahead of time, and your arrival is now confirmed. Enjoy the programme."
         else:
             msg = "Your arrival has been recorded. Enjoy the programme."
-        confirm_and_reset("success", "Welcome. You're checked in.", msg, context)
+        confirm_and_reset("success", "Welcome. You're checked in.", msg, context,
+                          seconds=CHECKIN_CONFIRM_SECONDS, stamp=server_checkin_time(member_id, ev["id"]))
     else:
         confirm_and_reset("info", "You're already checked in",
-                          "Your arrival was recorded earlier, so there's nothing more to do. Enjoy the programme.", context)
+                          "Your arrival was recorded earlier, so there's nothing more to do. Enjoy the programme.", context,
+                          seconds=CHECKIN_CONFIRM_SECONDS + 1, stamp=server_checkin_time(member_id, ev["id"]))
 
 
 def checkin_page():
@@ -1972,6 +2428,335 @@ def join_page():
             confirm_and_reset("success", "Welcome to the family",
                               "You're now on the Ignite member list. We'll keep you posted on upcoming programmes.",
                               "Membership", auto_reset=False, link=link)
+
+
+# ---------------------------------------------------------------------------
+# Public pages: Prophet Masterclass, live room gate, Google Meet
+# ---------------------------------------------------------------------------
+ICON_LOCK = ('<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2a5 5 0 0 1 5 5v3h1a2 2 0 0 1 2 2v8'
+             'a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2h1V7a5 5 0 0 1 5-5zm0 2a3 3 0 0 0-3 3v3h6V7a3 3 0 0 0-3-3z'
+             'm0 9.5a1.75 1.75 0 0 0-1 3.19V18h2v-1.31a1.75 1.75 0 0 0-1-3.19z"/></svg>')
+ICON_CLOCK = ('<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2a10 10 0 1 1 0 20 10 10 0 0 1 0-20z'
+              'm0 2a8 8 0 1 0 0 16 8 8 0 0 0 0-16zm1 3v4.6l3.2 1.9-1 1.7L11 12.7V7h2z"/></svg>')
+
+
+def deny_card(title: str, message: str, waiting: bool = False):
+    st.markdown(f"""<div class="ig-deny{' ig-wait' if waiting else ''}">
+                      <div class="ig-deny-icon">{ICON_CLOCK if waiting else ICON_LOCK}</div>
+                      <h3>{esc(title)}</h3><p>{esc(message)}</p></div>""", unsafe_allow_html=True)
+
+
+def redirect_browser(url: str, label: str, key: str):
+    """Send the whole browser window to the room. A same-tab button stays on
+    screen in case the phone blocks the automatic jump."""
+    target = json.dumps(url)
+    script = f"""<script>
+      (function () {{
+        const url = {target};
+        try {{
+          const d = window.parent.document;
+          const a = d.createElement('a');
+          a.href = url; a.target = '_top'; a.rel = 'noopener';
+          d.body.appendChild(a); a.click();
+          return;
+        }} catch (e) {{}}
+        try {{ window.top.location.href = url; }} catch (e) {{}}
+      }})();
+    </script>"""
+    with st.container(key="ig_go"):
+        if hasattr(st, "iframe"):
+            st.iframe(script, height=1)
+        else:
+            st.components.v1.html(script, height=0)
+    st.markdown(f'<a href="{html.escape(url, quote=True)}" target="_top" style="text-decoration:none">'
+                f'<div class="ig-muted" style="margin:.3rem 0 .6rem">Not moving? Tap the button below.</div></a>',
+                unsafe_allow_html=True)
+    st.link_button(label, url, type="primary", width="stretch")
+
+
+def pa_whatsapp_number() -> str:
+    return re.sub(r"\D", "", get_app_setting("pa_whatsapp") or get_setting("PA_WHATSAPP", DEFAULT_PA_WHATSAPP))
+
+
+def pa_whatsapp_url(reg: dict, session_name: str) -> str:
+    text = (f"Hello, I've registered for the Prophet Masterclass ({session_name}).\n"
+            f"Name: {reg['full_name']}\nRegistration token: {reg['reg_id']}\n"
+            f"I'm sending my proof of payment so my access can be approved. Thank you.")
+    number = pa_whatsapp_number()
+    return f"https://wa.me/{number}?text={quote(text)}" if number else f"https://wa.me/?text={quote(text)}"
+
+
+def live_link(base: str) -> str:
+    return f"{base}/?mode=live"
+
+
+def masterclass_link(base: str, session_id=None) -> str:
+    return f"{base}/?mode=masterclass" + (f"&session={session_id}" if session_id else "")
+
+
+def meet_link(base: str) -> str:
+    return f"{base}/?mode=meet"
+
+
+def session_ticket(sess: dict):
+    paid = sess["session_type"] == "Paid"
+    when = ""
+    if sess.get("session_date"):
+        try:
+            when = date.fromisoformat(sess["session_date"]).strftime("%a %d %b %Y")
+        except ValueError:
+            when = ""
+    sub_line = " · ".join(x for x in [when, "Paid session" if paid else "Free session"] if x)
+    st.markdown(
+        f"""<div class="ig-ticket">
+              <div class="ig-ticket-date">{ICON_FLAME}</div>
+              <div class="ig-ticket-body">
+                <div class="ig-ticket-type" style="color:{AMBER if paid else GREEN}">Prophet Masterclass</div>
+                <div class="ig-ticket-name">{esc(sess['session_name'])}</div>
+                <div class="ig-ticket-venue">{esc(sub_line)}</div>
+              </div>
+            </div>""", unsafe_allow_html=True)
+
+
+def token_card(reg: dict, sess: dict, is_new: bool):
+    approved = reg["payment_status"] in MC_APPROVED
+    status = ('<span class="ig-status ig-status-ok">Access approved</span>' if approved
+              else '<span class="ig-status ig-status-wait">Pending verification</span>')
+    if approved:
+        note = ("Keep this token. When the masterclass starts, open the live room and enter it "
+                "(or your phone number) to go straight in.")
+    else:
+        note = ("Your place is held. Send your proof of payment to the PA on WhatsApp with this token. "
+                "Once it's confirmed, the same token opens the live room.")
+    head = "You're registered" if is_new else "You're already registered"
+    st.markdown(f"""<div class="ig-tokencard">
+                      <div class="ig-kicker">{esc(head)}</div>
+                      <div class="ig-token">{esc(reg['reg_id'])}</div>
+                      {status}
+                      <p>{esc(note)}</p>
+                      <div class="ig-done-meta">{esc(sess['session_name'])} · {esc(first_name(reg['full_name']))}</div>
+                    </div>""", unsafe_allow_html=True)
+
+
+def masterclass_page():
+    brand_row()
+    result = st.session_state.get("mc_result")
+    if result:
+        sess = mc_session(result["session_id"]) or {"session_name": "Prophet Masterclass", "session_type": "Free",
+                                                    "price_note": None}
+        reg = result["reg"]
+        token_card(reg, sess, result["is_new"])
+        if reg["payment_status"] == MC_PENDING:
+            if sess.get("price_note"):
+                st.markdown(f'<div class="ig-note"><b>How to pay:</b> {esc(sess["price_note"])}</div>',
+                            unsafe_allow_html=True)
+            with st.container(key="wa_btn"):
+                st.link_button("Send payment proof to the PA on WhatsApp", pa_whatsapp_url(reg, sess["session_name"]),
+                               width="stretch", icon=":material/chat:")
+        else:
+            base = current_base_url()
+            if base_url_ok(base):
+                st.link_button("Go to the live room", live_link(base), type="primary", width="stretch")
+        if st.button("Done", width="stretch", key="mc_done"):
+            st.session_state.pop("mc_result", None)
+            st.session_state.form_nonce += 1
+            st.rerun()
+        return
+
+    sessions = mc_sessions(active_only=True)
+    page_heading("Prophet Masterclass", "Reserve your seat",
+                 "Register once and you'll get a personal token. It's your key to the live room.")
+    if not sessions:
+        deny_card("Enrolment isn't open yet", "There's no masterclass taking registrations right now. "
+                  "Please check back soon or watch the WhatsApp group for the link.", waiting=True)
+        return
+    wanted = st.query_params.get("session")
+    by_id = {x["id"]: x for x in sessions}
+    if wanted and str(wanted).isdigit() and int(wanted) in by_id:
+        sess = by_id[int(wanted)]
+    elif len(sessions) == 1:
+        sess = sessions[0]
+    else:
+        sess = by_id[st.selectbox("Choose a session", list(by_id),
+                                  format_func=lambda i: f"{by_id[i]['session_name']} · {by_id[i]['session_type']}")]
+    session_ticket(sess)
+    if sess["session_type"] == "Paid" and sess.get("price_note"):
+        st.markdown(f'<div class="ig-note"><b>This is a paid session.</b> {esc(sess["price_note"])}</div>',
+                    unsafe_allow_html=True)
+
+    nonce = st.session_state.form_nonce
+    k = lambda n: f"mc_{n}_{nonce}"
+    with st.form(key=k("form")):
+        st.markdown('<div class="ig-formtitle">Your details</div>'
+                    '<div class="ig-formnote">Use the phone number you\'ll have with you on the day.</div>',
+                    unsafe_allow_html=True)
+        name = st.text_input("Full name *", placeholder="e.g. Ama Serwaa Mensah", key=k("name"))
+        email = st.text_input("Email *", placeholder="you@example.com", key=k("email"))
+        c1, c2 = st.columns([1, 1.5])
+        country = c1.selectbox("Country", COUNTRY_NAMES, format_func=country_label, key=k("cc"))
+        raw = c2.text_input("Phone number *", placeholder="e.g. 024 123 4567", autocomplete="tel", key=k("ph"))
+        go = st.form_submit_button("Register & get my token", type="primary", width="stretch")
+    if not go:
+        return
+    phone = to_intl(raw, country)
+    errors = []
+    if len(name.strip()) < 2:
+        errors.append("Enter your full name.")
+    if not is_valid_email(email):
+        errors.append("Enter a valid email address.")
+    problem = phone_problem(phone) if raw.strip() else "Enter your phone number."
+    if country == "Other country" and raw.strip() and not raw.strip().startswith(("+", "00")):
+        problem = "For other countries, start with + and the country code."
+    if problem:
+        errors.append(problem)
+    fresh = mc_session(sess["id"])
+    if not fresh or not fresh["active_status"]:
+        errors.append("Enrolment for this session has just closed.")
+    if errors:
+        show_errors(errors)
+        return
+    reg, is_new = mc_register(fresh, name, email, phone)
+    st.session_state.mc_result = {"reg": reg, "session_id": fresh["id"], "is_new": is_new}
+    st.session_state.form_nonce += 1
+    st.rerun()
+
+
+def live_gate_page():
+    brand_row()
+    page_heading("Join Live Masterclass Room", "Enter the room",
+                 "Type your registration token or the phone number you registered with.")
+    go_to = st.session_state.get("live_go")
+    if go_to:
+        st.markdown(f"""<div class="ig-done ig-done-success">
+                          <div class="ig-done-seal">{ICON_CHECK}</div>
+                          <div class="ig-done-kicker">Access granted</div>
+                          <h2>Welcome, {esc(go_to['first'])}</h2>
+                          <p>Taking you into {esc(go_to['session'])} now…</p></div>""", unsafe_allow_html=True)
+        redirect_browser(go_to["url"], "Open the live room", "live")
+        if st.button("Back", key="live_back", width="stretch"):
+            st.session_state.pop("live_go", None)
+            st.rerun()
+        return
+
+    locked = st.session_state.get("gate_locked_until", 0)
+    if locked > time.time():
+        deny_card("Too many tries", f"Please wait {int(locked - time.time())} seconds and try again.")
+        return
+
+    nonce = st.session_state.form_nonce
+    with st.form(key=f"gate_form_{nonce}"):
+        c1, c2 = st.columns([1, 1.6])
+        country = c1.selectbox("Country (for phone numbers)", COUNTRY_NAMES, format_func=country_label,
+                               key=f"gate_cc_{nonce}")
+        entry = c2.text_input("Token or phone number", placeholder="IGNITE-8921 or 024 123 4567",
+                              key=f"gate_in_{nonce}")
+        go = st.form_submit_button("Join live room", type="primary", width="stretch", icon=":material/lock_open:")
+
+    choice = st.session_state.get("gate_choices")
+    if go:
+        st.session_state.pop("gate_choices", None)
+        choice = None
+        if not entry.strip():
+            show_errors(["Enter your token or phone number."])
+            return
+        matches = mc_lookup(entry, country)
+        approved = [m for m in matches if m["payment_status"] in MC_APPROVED]
+        if not approved:
+            st.session_state.gate_fails = st.session_state.get("gate_fails", 0) + 1
+            if st.session_state.gate_fails >= MAX_LOGIN_ATTEMPTS:
+                st.session_state.gate_locked_until = time.time() + LOCKOUT_SECONDS
+                st.session_state.gate_fails = 0
+            time.sleep(0.8)
+            if matches:   # registered but not paid yet
+                m = matches[0]
+                deny_card("Payment not confirmed yet",
+                          f"Your token {m['reg_id']} is registered, but the PA hasn't confirmed your payment. "
+                          "Send your proof of payment on WhatsApp and try again once it's approved.", waiting=True)
+                with st.container(key="wa_gate"):
+                    st.link_button("Message the PA on WhatsApp", pa_whatsapp_url(m, m["session_name"]),
+                                   width="stretch", icon=":material/chat:")
+            else:
+                deny_card("Access denied", "We couldn't find an approved registration for that token or number on an "
+                          "open session. Check for typos, or register first.")
+                base = current_base_url()
+                if base_url_ok(base):
+                    st.link_button("Register for the masterclass", masterclass_link(base), width="stretch")
+            return
+        st.session_state.gate_fails = 0
+        if len(approved) == 1:
+            choice = approved
+        else:
+            st.session_state.gate_choices = approved
+            choice = approved
+    if not choice:
+        return
+    if len(choice) > 1:
+        st.markdown('<div class="ig-formtitle" style="margin-top:.8rem">Which room?</div>', unsafe_allow_html=True)
+    for m in choice:
+        if len(choice) > 1 and not st.button(m["session_name"], key=f"pick_{m['reg_id']}", width="stretch"):
+            continue
+        st.session_state.pop("gate_choices", None)
+        if not (m.get("streaming_url") or "").startswith("http"):
+            deny_card("The room isn't open yet", "You're approved, but the stream link hasn't been added. "
+                      "Please try again in a few minutes.", waiting=True)
+            return
+        mc_log_entry(m["reg_id"], m["session_id"])
+        st.session_state.live_go = {"url": m["streaming_url"], "session": m["session_name"],
+                                    "first": first_name(m["full_name"])}
+        st.session_state.form_nonce += 1
+        st.rerun()
+
+
+def meet_page():
+    brand_row()
+    page_heading("Daily prayer room", "Join us on Google Meet",
+                 "Tell us who you are, then we'll take you straight into the room.")
+    url = get_app_setting("meet_url").strip()
+    is_open = get_app_setting("meet_open", "1") == "1"
+    go_to = st.session_state.get("meet_go")
+    if go_to:
+        st.markdown(f"""<div class="ig-done ig-done-success">
+                          <div class="ig-done-seal">{ICON_CHECK}</div>
+                          <div class="ig-done-kicker">Attendance recorded · {esc(go_to['time'])} GMT</div>
+                          <h2>Welcome, {esc(go_to['first'])}</h2>
+                          <p>Opening the Google Meet prayer room…</p></div>""", unsafe_allow_html=True)
+        redirect_browser(go_to["url"], "Open Google Meet", "meet")
+        if st.button("Back", key="meet_back", width="stretch"):
+            st.session_state.pop("meet_go", None)
+            st.rerun()
+        return
+    if not url.startswith("https://") or not is_open:
+        deny_card("The prayer room isn't open right now", "Please check the WhatsApp group for today's time "
+                  "and come back then.", waiting=True)
+        return
+    nonce = st.session_state.form_nonce
+    with st.form(key=f"meet_form_{nonce}"):
+        st.markdown('<div class="ig-formnote">Use the exact name you show on Google Meet, so we can match you '
+                    'in the room.</div>', unsafe_allow_html=True)
+        display = st.text_input("Your Google Meet display name *", placeholder="e.g. Ama Mensah", key=f"meet_nm_{nonce}")
+        c1, c2 = st.columns([1, 1.5])
+        country = c1.selectbox("Country", COUNTRY_NAMES, format_func=country_label, key=f"meet_cc_{nonce}")
+        raw = c2.text_input("Phone number *", placeholder="e.g. 024 123 4567", autocomplete="tel", key=f"meet_ph_{nonce}")
+        go = st.form_submit_button("Join room", type="primary", width="stretch", icon=":material/videocam:")
+    if not go:
+        return
+    phone = to_intl(raw, country)
+    errors = []
+    if len(display.strip()) < 2:
+        errors.append("Enter your Google Meet display name.")
+    problem = phone_problem(phone) if raw.strip() else "Enter your phone number."
+    if country == "Other country" and raw.strip() and not raw.strip().startswith(("+", "00")):
+        problem = "For other countries, start with + and the country code."
+    if problem:
+        errors.append(problem)
+    if errors:
+        show_errors(errors)
+        return
+    meet_log(display, phone)
+    st.session_state.meet_go = {"url": url, "first": first_name(display),
+                                "time": datetime.now(timezone.utc).strftime("%H:%M")}
+    st.session_state.form_nonce += 1
+    st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -2191,8 +2976,22 @@ def overview_tab():
     c[3].metric("Pre-registrations", s["preregs"])
     c[4].metric("Check-ins", s["checkins"])
     c[5].metric("Checked in today", s["today"])
-    st.info("Free hosting can clear the database when the app restarts. Download a backup from the "
-            "**Backup** tab after every event.", icon=":material/backup:")
+    if DB_IS_PERSISTENT:
+        st.success(f"Data is saved on the permanent disk ({DB_PATH}). Restarts and updates don't erase it. "
+                   "A backup now and then is still wise.", icon=":material/verified:")
+    else:
+        st.warning("This copy isn't using a permanent disk, so a restart could clear the data. On Render, attach a "
+                   "disk at /data. Until then, download a backup from the **Backup** tab after every event.",
+                   icon=":material/backup:")
+    mc = query_df("""SELECT
+            (SELECT COUNT(*) FROM masterclass_registrations WHERE payment_status = 'Pending Verification') AS pending,
+            (SELECT COUNT(*) FROM masterclass_registrations) AS mc_total,
+            (SELECT COUNT(DISTINCT phone_number) FROM google_meet_tracker WHERE tracking_date = date('now')) AS meet_today
+        """).iloc[0]
+    m = st.columns(3)
+    m[0].metric("Masterclass registrations", int(mc["mc_total"]))
+    m[1].metric("Payments waiting for the PA", int(mc["pending"]))
+    m[2].metric("In the Google Meet today", int(mc["meet_today"]))
     summary = events_summary()
     if summary.empty:
         st.caption("No events yet. Create your first one in the **Events** tab.")
@@ -2201,7 +3000,7 @@ def overview_tab():
     chart = summary.head(10).copy()
     chart["Label"] = chart["Event"] + " (#" + chart["id"].astype(str) + ")"
     st.bar_chart(chart.set_index("Label")[["Pre-Registered", "Checked In"]], horizontal=True,
-                 stack=False, color=[GOLD, ROYAL], x_label="People", y_label="")
+                 stack=False, color=["#8B94A7", RED], x_label="People", y_label="")
     summary["Date"] = summary["Date"].map(fmt_date)
     st.dataframe(summary.drop(columns=["id"]), hide_index=True, width="stretch")
 
@@ -2957,12 +3756,311 @@ def backup_tab():
             st.error(str(err))
 
 
+# ---------------------------------------------------------------------------
+# Admin: Prophet Masterclass
+# ---------------------------------------------------------------------------
+def member_whatsapp_url(phone: str, text: str) -> str:
+    return f"https://wa.me/{re.sub(r'[^0-9]', '', phone or '')}?text={quote(text)}"
+
+
+def pa_grid_section():
+    st.markdown("#### PA Verification Grid")
+    st.caption("Everyone who registered for a paid session and is waiting for their payment to be checked. "
+               "Confirm the money has arrived, then tap **Approve Payment**. Their token opens the live room straight away.")
+    notice = st.session_state.pop("pa_notice", None)
+    if notice:
+        st.success(notice[0])
+        if notice[1]:
+            with st.container(key="wa_pa_tell"):
+                st.link_button("Tell them on WhatsApp", notice[1], icon=":material/chat:")
+    sessions = mc_sessions()
+    paid = [x for x in sessions if x["session_type"] == "Paid"]
+    if not paid:
+        st.info("No paid sessions yet. Create one in **Sessions** and set the type to Paid.")
+        return
+    opts = [0] + [x["id"] for x in paid]
+    names = {0: "All paid sessions", **{x["id"]: x["session_name"] for x in paid}}
+    c1, c2 = st.columns([1, 1])
+    pick = c1.selectbox("Session", opts, format_func=lambda i: names[i], key="pa_session")
+    search = c2.text_input("Find a token, name or number", key="pa_search", placeholder="IGNITE-8921")
+    df = mc_registrations(pick or None, MC_PENDING)
+    df = df[df["Type"] == "Paid"]
+    if search.strip():
+        t = search.strip()
+        digits = re.sub(r"\D", "", t).lstrip("0")
+        mask = (df["Token"].str.contains(t.upper(), regex=False) |
+                df["Full Name"].str.contains(t, case=False, regex=False))
+        if digits:
+            mask |= df["Phone"].str.contains(digits, regex=False)
+        df = df[mask]
+    m = st.columns(3)
+    m[0].metric("Waiting for approval", len(df))
+    m[1].metric("Approved (paid)", int(sum(x["approved"] for x in paid if not pick or x["id"] == pick)))
+    m[2].metric("Joined the room", int(sum(x["joined"] for x in paid if not pick or x["id"] == pick)))
+    if df.empty:
+        st.markdown('<div class="ig-note">Nothing waiting. Every paid registration has been checked.</div>',
+                    unsafe_allow_html=True)
+    for _, r in df.head(100).iterrows():
+        with st.container(key=f"glass_pa_{r['Token']}"):
+            a, b = st.columns([3, 1.2], vertical_alignment="center")
+            a.markdown(f"<b>{esc(r['Full Name'])}</b> &nbsp;<code>{esc(r['Token'])}</code>"
+                       f"<div class='ig-rowmeta'>{esc(fmt_phone(r['Phone']))} · {esc(r['Session'])} · "
+                       f"registered {esc(r['Registered (GMT)'])} GMT</div>", unsafe_allow_html=True)
+            if b.button("Approve Payment", key=f"approve_{r['Token']}", type="primary", width="stretch"):
+                mc_set_status([r["Token"]], MC_PAID, current_admin().get("name", "PA"))
+                log_action(f"Approved masterclass payment for {r['Full Name']} ({r['Token']})")
+                base = current_base_url()
+                room = f"\n\nJoin here when it starts: {live_link(base)}" if base_url_ok(base) else ""
+                text = (f"Hello {first_name(r['Full Name'])}, your payment for the Prophet Masterclass "
+                        f"({r['Session']}) is confirmed. Your token {r['Token']} is now active.{room}")
+                st.session_state.pa_notice = (f"Approved {r['Full Name']} ({r['Token']}).",
+                                              member_whatsapp_url(r["Phone"], text))
+                st.rerun()
+    if len(df) > 100:
+        st.caption(f"Showing the first 100 of {len(df)}. Use the search box to find someone.")
+    with st.expander("Recently approved (undo a mistake)"):
+        done = mc_registrations(pick or None, MC_PAID).head(30)
+        if done.empty:
+            st.caption("No approved payments yet.")
+        for _, r in done.iterrows():
+            a, b = st.columns([3, 1], vertical_alignment="center")
+            a.markdown(f"**{r['Full Name']}** `{r['Token']}` · {r['Session']} · by {r['Approved By'] or '?'}")
+            if b.button("Move back to pending", key=f"undo_{r['Token']}", width="stretch"):
+                mc_set_status([r["Token"]], MC_PENDING, current_admin().get("name", "PA"))
+                log_action(f"Moved {r['Full Name']} ({r['Token']}) back to Pending Verification")
+                st.rerun()
+
+
+def mc_session_form(key: str, sess: dict | None = None):
+    sess = sess or {}
+    with st.form(key):
+        name = st.text_input("Session name *", value=sess.get("session_name", ""),
+                             placeholder="e.g. Prophet Masterclass: The Prophetic Voice")
+        c1, c2 = st.columns(2)
+        stype = c1.selectbox("Session type", MC_TYPES, index=MC_TYPES.index(sess.get("session_type", "Free")),
+                             help="Free: everyone is approved straight away. Paid: the PA approves each payment.")
+        try:
+            dval = date.fromisoformat(sess["session_date"]) if sess.get("session_date") else None
+        except ValueError:
+            dval = None
+        sdate = c2.date_input("Date (optional)", value=dval, format="DD/MM/YYYY")
+        url = st.text_input("Secret streaming link", value=sess.get("streaming_url") or "",
+                            placeholder="https://youtube.com/live/… or https://zoom.us/j/…",
+                            help="Only approved members are sent here. It never appears on a public page.")
+        price = st.text_input("Payment instructions (paid sessions)", value=sess.get("price_note") or "",
+                              placeholder="e.g. GHS 150 by MoMo to 024 000 0000 (Ignite Prayer Network)")
+        active = st.toggle("Active (open for enrolment and the live room)", value=bool(sess.get("active_status", 1)))
+        saved = st.form_submit_button("Save session" if sess else "Create session", type="primary")
+    if not saved:
+        return None
+    errors = []
+    if len(name.strip()) < 3:
+        errors.append("Give the session a name.")
+    if url.strip() and not url.strip().startswith("https://"):
+        errors.append("The streaming link should start with https://")
+    if errors:
+        show_errors(errors)
+        return None
+    return {"name": name, "session_type": stype, "streaming_url": url, "session_date": sdate.isoformat() if sdate else None,
+            "price_note": price, "active": active}
+
+
+def mc_sessions_section():
+    with st.expander("Create a new masterclass session", expanded=not mc_sessions()):
+        data = mc_session_form("mc_new")
+        if data:
+            mc_create_session(data["name"], data["session_type"], data["streaming_url"], data["session_date"],
+                              data["price_note"], data["active"])
+            notify(f"Created the masterclass session “{data['name'].strip()}” ({data['session_type']}).")
+            st.rerun()
+    sessions = mc_sessions()
+    if not sessions:
+        return
+    rows = pd.DataFrame([{
+        "Session": x["session_name"], "Type": x["session_type"], "Status": "Active" if x["active_status"] else "Closed",
+        "Date": fmt_date(x["session_date"]), "Registered": x["registered"], "Approved": x["approved"],
+        "Pending": x["pending"], "Joined Room": x["joined"],
+        "Stream Link": "Set" if (x["streaming_url"] or "").startswith("http") else "Missing"} for x in sessions])
+    st.dataframe(rows, hide_index=True, width="stretch")
+    by_id = {x["id"]: x for x in sessions}
+    pick = st.selectbox("Manage a session", list(by_id), key="mc_manage",
+                        format_func=lambda i: f"{by_id[i]['session_name']} · {by_id[i]['session_type']}")
+    sess = by_id[pick]
+    c1, c2 = st.columns([3, 2])
+    with c1:
+        data = mc_session_form(f"mc_edit_{pick}", sess)
+        if data:
+            if data["session_type"] != sess["session_type"] and sess["registered"]:
+                st.warning("People have already registered under the old type. Their status stays as it is; "
+                           "use the PA grid if anyone needs changing.")
+            mc_update_session(pick, data["name"], data["session_type"], data["streaming_url"], data["session_date"],
+                              data["price_note"], data["active"])
+            notify(f"Updated the masterclass session “{data['name'].strip()}”.")
+            st.rerun()
+    with c2:
+        base = current_base_url()
+        if base_url_ok(base):
+            st.markdown("**Enrolment link for this session**")
+            st.code(masterclass_link(base, pick), language=None)
+        with st.container(key="glass_mc_delete"):
+            st.markdown("**Delete this session**")
+            st.caption(f"Removes the session and its {sess['registered']} registration(s). This can't be undone.")
+            sure = st.checkbox("Yes, delete it", key=f"mc_del_sure_{pick}")
+            if st.button("Delete session", key=f"mc_del_{pick}", disabled=not sure):
+                n = mc_delete_session(pick)
+                notify(f"Deleted the masterclass session “{sess['session_name']}” and {n} registration(s).")
+                st.rerun()
+
+
+def mc_registrations_section():
+    sessions = mc_sessions()
+    if not sessions:
+        st.info("No sessions yet.")
+        return
+    opts = [0] + [x["id"] for x in sessions]
+    names = {0: "All sessions", **{x["id"]: x["session_name"] for x in sessions}}
+    c1, c2, c3 = st.columns([1.3, 1, 1.2])
+    pick = c1.selectbox("Session", opts, format_func=lambda i: names[i], key="mcr_session")
+    status = c2.selectbox("Status", ["Any", MC_FREE, MC_PENDING, MC_PAID], key="mcr_status")
+    search = c3.text_input("Search", key="mcr_search", placeholder="Name, token or number")
+    df = mc_registrations(pick or None, None if status == "Any" else status)
+    if search.strip():
+        t = search.strip()
+        digits = re.sub(r"\D", "", t).lstrip("0")
+        mask = (df["Token"].str.contains(t.upper(), regex=False) |
+                df["Full Name"].str.contains(t, case=False, regex=False) |
+                df["Email"].str.contains(t, case=False, regex=False))
+        if digits:
+            mask |= df["Phone"].str.contains(digits, regex=False)
+        df = df[mask]
+    st.caption(f"{len(df)} registration(s). “Room Entries” counts every time a token was used to enter; "
+               "a high number can mean a token is being shared.")
+    view = df.copy()
+    view["Phone"] = view["Phone"].map(fmt_phone)
+    st.dataframe(view, hide_index=True, width="stretch", height=380)
+    download_pair(df, "Ignite_masterclass_registrations", "Masterclass", "mcr")
+    if current_admin().get("role") in ("Owner", "Admin") and not df.empty:
+        with st.expander("Remove a registration"):
+            tok = st.selectbox("Token", df["Token"].tolist(), key="mcr_del_tok",
+                               format_func=lambda t: f"{t} · {df.loc[df['Token'] == t, 'Full Name'].iloc[0]}")
+            if st.button("Remove", key="mcr_del_go"):
+                mc_delete_registration(tok)
+                notify(f"Removed masterclass registration {tok}.")
+                st.rerun()
+
+
+def mc_links_section():
+    base = current_base_url()
+    st.markdown("#### PA WhatsApp number")
+    st.caption("People on paid sessions get a button that opens a WhatsApp chat with this number, "
+               "already filled in with their name and token.")
+    current = get_app_setting("pa_whatsapp") or get_setting("PA_WHATSAPP", DEFAULT_PA_WHATSAPP)
+    st.markdown(f"Currently: **{fmt_phone(current)}**")
+    with st.form("pa_number_form"):
+        raw, country = admin_phone_input("pa_wa", "PA's WhatsApp number")
+        if st.form_submit_button("Save PA number", type="primary"):
+            phone = to_intl(raw, country)
+            if phone_problem(phone):
+                st.error(phone_problem(phone))
+            else:
+                set_app_setting("pa_whatsapp", phone)
+                notify(f"Set the PA WhatsApp number to {fmt_phone(phone)}.")
+                st.rerun()
+    if not base_url_ok(base):
+        st.warning("Set the app's web address (Members → Membership link) to get the share links and QR codes.")
+        return
+    st.divider()
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Masterclass enrolment link**")
+        st.code(masterclass_link(base), language=None)
+        poster_block(masterclass_link(base), "Prophet Masterclass", "", "", "", "Enrolment",
+                     "Scan to reserve your seat", "Ignite_masterclass_enrol", "mc_enrol")
+    with c2:
+        st.markdown("**Join Live Masterclass Room**")
+        st.code(live_link(base), language=None)
+        poster_block(live_link(base), "Join the Live Masterclass Room", "", "", "", "Live room",
+                     "Scan and enter your token", "Ignite_masterclass_live", "mc_live")
+
+
+def masterclass_tab(pa_only: bool = False):
+    if pa_only:
+        tabs = st.tabs(["PA Verification Grid", "Registrations"])
+        with tabs[0]:
+            pa_grid_section()
+        with tabs[1]:
+            mc_registrations_section()
+        return
+    tabs = st.tabs(["PA Verification Grid", "Sessions", "Registrations", "Links & PA number"])
+    with tabs[0]:
+        pa_grid_section()
+    with tabs[1]:
+        mc_sessions_section()
+    with tabs[2]:
+        mc_registrations_section()
+    with tabs[3]:
+        mc_links_section()
+
+
+# ---------------------------------------------------------------------------
+# Admin: daily Google Meet
+# ---------------------------------------------------------------------------
+def meet_tab():
+    left, right = st.columns([3, 2])
+    with left:
+        st.markdown("#### Today's prayer room")
+        with st.form("meet_settings"):
+            url = st.text_input("Google Meet link", value=get_app_setting("meet_url"),
+                                placeholder="https://meet.google.com/abc-defg-hij")
+            is_open = st.toggle("Room open (members can use the join page)", value=get_app_setting("meet_open", "1") == "1")
+            if st.form_submit_button("Save", type="primary"):
+                if url.strip() and not url.strip().startswith("https://"):
+                    st.error("Paste the full Meet link, starting with https://")
+                else:
+                    set_app_setting("meet_url", url.strip())
+                    set_app_setting("meet_open", "1" if is_open else "0")
+                    notify("Updated the Google Meet room settings.")
+                    st.rerun()
+        day = st.date_input("Attendance for", value=today_local(), format="DD/MM/YYYY", key="meet_day")
+        df = meet_attendance(day.isoformat())
+        m = st.columns(2)
+        m[0].metric("People", len(df))
+        m[1].metric("Matched to a member", int((df["Member On File"] != "").sum()) if not df.empty else 0)
+        if df.empty:
+            st.caption("Nobody has joined through the app on this day.")
+        else:
+            view = df.copy()
+            view["Phone"] = view["Phone"].map(fmt_phone)
+            st.dataframe(view, hide_index=True, width="stretch", height=340)
+            download_pair(df, f"Ignite_meet_{day.isoformat()}", "Google Meet", "meet_day_dl")
+        totals = meet_daily_totals(30)
+        if not totals.empty:
+            st.markdown("#### Last 30 days")
+            st.bar_chart(totals.set_index("Date"), color=RED, y_label="People", x_label="")
+        with st.expander("Export everything"):
+            full = meet_full_export()
+            st.caption(f"{len(full)} join(s) recorded in total.")
+            download_pair(full, "Ignite_meet_all", "Google Meet", "meet_all_dl")
+    with right:
+        base = current_base_url()
+        if base_url_ok(base):
+            st.markdown("**Daily join link.** Share this instead of the Meet link, so attendance is recorded.")
+            st.code(meet_link(base), language=None)
+            msg = (f"Our prayer room is open. Join here so we can see you came:\n{meet_link(base)}\n\n{APP_NAME}")
+            st.link_button("Share on WhatsApp", f"https://wa.me/?text={quote(msg)}", type="primary", width="stretch")
+            poster_block(meet_link(base), "Daily Prayer Room", "", "", "", "Google Meet",
+                         "Scan to join the prayer room", "Ignite_google_meet", "meet")
+        else:
+            st.warning("Set the app's web address (Members → Membership link) to get the share link.")
+
+
 def admin_page():
     if not admin_is_authenticated():
         admin_login()
         return
     user = current_admin()
-    c1, c2 = st.columns([4, 1])
+    bar = st.container(key="glass_topbar")
+    c1, c2 = bar.columns([4, 1], vertical_alignment="center")
     with c1:
         st.markdown(f"""<div class="ig-brand" style="margin:0">
               <div class="ig-mark">{ICON_FLAME}</div>
@@ -2978,28 +4076,40 @@ def admin_page():
 
     if user["role"] == "Usher":
         tabs = st.tabs([":material/fact_check: Check-ins", ":material/person: My account"])
-        with tabs[0]:
+        with tabs[0], st.container(key="glass_panel_usher"):
             attendance_tab(limited=True)
-        with tabs[1]:
+        with tabs[1], st.container(key="glass_panel_account"):
+            account_section()
+        return
+    if user["role"] == "PA":
+        tabs = st.tabs([":material/verified: Masterclass", ":material/person: My account"])
+        with tabs[0], st.container(key="glass_panel_pa"):
+            masterclass_tab(pa_only=True)
+        with tabs[1], st.container(key="glass_panel_pa_account"):
             account_section()
         return
 
     tabs = st.tabs([":material/dashboard: Overview", ":material/event: Events", ":material/how_to_reg: Pre-registrations",
                     ":material/fact_check: Check-ins", ":material/group: Members",
+                    ":material/school: Masterclass", ":material/videocam: Google Meet",
                     ":material/admin_panel_settings: Team", ":material/backup: Backup"])
-    with tabs[0]:
+    with tabs[0], st.container(key="glass_panel_overview"):
         overview_tab()
-    with tabs[1]:
+    with tabs[1], st.container(key="glass_panel_events"):
         events_tab()
-    with tabs[2]:
+    with tabs[2], st.container(key="glass_panel_prereg"):
         prereg_tab()
-    with tabs[3]:
+    with tabs[3], st.container(key="glass_panel_checkins"):
         attendance_tab()
-    with tabs[4]:
+    with tabs[4], st.container(key="glass_panel_members"):
         members_tab()
-    with tabs[5]:
+    with tabs[5], st.container(key="glass_panel_masterclass"):
+        masterclass_tab()
+    with tabs[6], st.container(key="glass_panel_meet"):
+        meet_tab()
+    with tabs[7], st.container(key="glass_panel_team"):
         team_tab()
-    with tabs[6]:
+    with tabs[8], st.container(key="glass_panel_backup"):
         backup_tab()
 
 
@@ -3014,11 +4124,12 @@ def main():
         mode = "admin"
     elif st.query_params.get("mode") == "register":
         mode = "register"
-    elif st.query_params.get("mode") == "join":
-        mode = "join"
+    elif st.query_params.get("mode") in ("join", "masterclass", "live", "meet"):
+        mode = st.query_params.get("mode")
     else:
         mode = "checkin"
-    titles = {"admin": "Admin", "register": "Reserve your place", "join": "Join", "checkin": "Check-in"}
+    titles = {"admin": "Admin", "register": "Reserve your place", "join": "Join", "checkin": "Check-in",
+              "masterclass": "Prophet Masterclass", "live": "Live Masterclass Room", "meet": "Prayer Room"}
     st.set_page_config(page_title=f"{titles[mode]} · {APP_NAME}", page_icon="🔥",
                        layout="wide" if mode == "admin" and logged_in else "centered",
                        initial_sidebar_state="collapsed")
@@ -3031,6 +4142,15 @@ def main():
         public_footer()
     elif mode == "join":
         join_page()
+        public_footer()
+    elif mode == "masterclass":
+        masterclass_page()
+        public_footer()
+    elif mode == "live":
+        live_gate_page()
+        public_footer()
+    elif mode == "meet":
+        meet_page()
         public_footer()
     else:
         checkin_page()
