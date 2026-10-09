@@ -1859,6 +1859,24 @@ div.stButton > button, div.stFormSubmitButton > button, div.stDownloadButton > b
 .ig-badge {{ display:inline-block; color:#fff; font-size:.64rem; font-weight:700; letter-spacing:.14em;
             text-transform:uppercase; padding:.2rem .55rem; border-radius:999px; }}
 
+/* ---- always-readable text, whatever theme the server was started with ---- */
+.stApp {{ color: var(--ink); }}
+.stTabs [data-baseweb="tab"] p, .stTabs [data-baseweb="tab"] span {{ color: var(--muted) !important; }}
+.stTabs [aria-selected="true"] p, .stTabs [aria-selected="true"] span {{ color: var(--royal) !important; }}
+.stTabs [data-baseweb="tab"]:hover p {{ color: var(--ink) !important; }}
+.stApp label p, .stApp label, [data-testid="stWidgetLabel"] p, [data-testid="stMarkdownContainer"] p,
+.stApp li, [data-testid="stExpander"] summary p, [data-testid="stCheckbox"] p, [data-testid="stRadio"] p {{ color: var(--ink) !important; }}
+[data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] p {{ color: var(--muted) !important; }}
+[data-baseweb="input"], [data-baseweb="base-input"], [data-baseweb="textarea"], [data-baseweb="select"] > div {{
+    background-color: var(--sand) !important; border-color: var(--line) !important; }}
+[data-baseweb="input"] input, [data-baseweb="textarea"] textarea, [data-baseweb="select"] span {{
+    color: var(--ink) !important; -webkit-text-fill-color: var(--ink); }}
+[data-baseweb="input"] input::placeholder, textarea::placeholder {{ color: #9A93A8 !important; -webkit-text-fill-color: #9A93A8; }}
+[data-baseweb="popover"] ul, [data-baseweb="menu"] {{ background: #fff !important; }}
+[data-baseweb="popover"] li, [data-baseweb="menu"] li {{ color: var(--ink) !important; }}
+[data-testid="stMetricValue"], [data-testid="stMetricValue"] div {{ color: var(--ink) !important; }}
+[data-testid="stMetricLabel"] p {{ color: var(--muted) !important; }}
+
 /* ---- footer centring ---- */
 .st-key-ig_footer_btn > div, .st-key-ig_footer_btn [data-testid="stElementContainer"] {{ width:100% !important;
     display:flex !important; justify-content:center !important; }}
