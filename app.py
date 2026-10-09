@@ -3525,10 +3525,6 @@ def import_section():
         st.error("That file couldn't be read. Save it as .xlsx or .csv and try again.")
         return
     raw = raw.dropna(how="all")
-            # Force all blank or broken spots to become safe text instead of float numbers
-    raw = raw.fillna("")
-    for col in raw.columns:
-        raw[col] = raw[col].astype(str).str.strip()
     cols = list(raw.columns)
     if not cols:
         st.error("The file looks empty.")
@@ -3567,20 +3563,35 @@ def import_section():
     st.caption(f"{len(new)} new · {int((preview['Result'] == 'Already on the list').sum())} already on the list · "
                f"{int(preview['Result'].str.startswith('Skipped').sum())} skipped")
     if st.button(f"Import {len(new)} member(s)", type="primary", disabled=new.empty, key="do_import"):
-        added = 0
-        for _, r in new.iterrows():
-            try:
-                create_member({"full_name": r["Name"], "phone_number": r["Phone"], "whatsapp_number": r["Phone"],
-                               "email": r["Email"] or None, "country": country_from_number(r["Phone"]),
-                               "source": "Imported",
-                               "birth_day": str(r["_bday"]).split("/")[0] if r.get("_bday") and str(r["_bday"]).strip() and "/" in str(r["_bday"]) else None,
-                               "birth_month": str(r["_bday"]).split("/")[1] if r.get("_bday") and str(r["_bday"]).strip() and "/" in str(r["_bday"]) and len(str(r["_bday"]).split("/")) > 1 else None
-
-                added += 1
-            except sqlite3.IntegrityError:
-                pass
+        # Work from the plain list, not the table: pandas turns an empty birthday
+        # into NaN, which used to crash the import halfway through.
+        to_add = [r for r in rows if r["Result"] == "Will be added"]
+        added, failed = 0, []
+        progress = st.progress(0.0, text="Importing members…")
+        with closing(get_conn()) as conn, conn:          # one transaction: fast, even for big lists
+            for i, r in enumerate(to_add, 1):
+                bday = r["_bday"] if isinstance(r["_bday"], tuple) and len(r["_bday"]) == 2 else (None, None)
+                try:
+                    conn.execute(
+                        f"""INSERT INTO members ({', '.join(MEMBER_FIELDS)}, consent_at)
+                            VALUES ({', '.join('?' for _ in MEMBER_FIELDS)}, CURRENT_TIMESTAMP)""",
+                        [{"full_name": r["Name"], "phone_number": r["Phone"], "whatsapp_number": r["Phone"],
+                          "email": r["Email"] or None, "country": country_from_number(r["Phone"]),
+                          "emergency_contact_name": None, "emergency_contact_phone": None,
+                          "parent_guardian_phone": None, "is_minor": 0, "source": "Imported",
+                          "birth_day": bday[0], "birth_month": bday[1]}[f] for f in MEMBER_FIELDS])
+                    added += 1
+                except sqlite3.IntegrityError:
+                    pass                                   # already on the list
+                except Exception as err:                   # one odd row never stops the rest
+                    failed.append(f"{r['Name']} ({err})")
+                if i % 25 == 0 or i == len(to_add):
+                    progress.progress(i / len(to_add), text=f"Importing members… {i} of {len(to_add)}")
         st.session_state.pop("import_file", None)
-        notify(f"Imported {added} member(s) from {upload.name}.")
+        msg = f"Imported {added} member(s) from {upload.name}."
+        if failed:
+            msg += f" {len(failed)} row(s) couldn't be added: " + "; ".join(failed[:5])
+        notify(msg)
         st.rerun()
 
 
