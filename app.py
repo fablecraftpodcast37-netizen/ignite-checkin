@@ -3526,9 +3526,9 @@ def import_section():
         return
     raw = raw.dropna(how="all")
             # Force all blank or broken spots to become safe text instead of float numbers
-        raw = raw.fillna("")
-        for col in raw.columns:
-            raw[col] = raw[col].astype(str).str.strip()
+    raw = raw.fillna("")
+    for col in raw.columns:
+        raw[col] = raw[col].astype(str).str.strip()
     cols = list(raw.columns)
     if not cols:
         st.error("The file looks empty.")
