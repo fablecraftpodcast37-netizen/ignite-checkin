@@ -3569,7 +3569,8 @@ def import_section():
                 create_member({"full_name": r["Name"], "phone_number": r["Phone"], "whatsapp_number": r["Phone"],
                                "email": r["Email"] or None, "country": country_from_number(r["Phone"]),
                                "source": "Imported",
-                               "birth_day": r["_bday"][0] if r["_bday"] else None,
+                               "birth_day": str(r["_bday"])[0] if (isinstance(r["_bday"], str) or (isinstance(r["_bday"], float) and not pd.isna(r["_bday"]))) and len(str(r["_bday"])) > 0 else None,
+
                                "birth_month": r["_bday"][1] if r["_bday"] else None})
                 added += 1
             except sqlite3.IntegrityError:
