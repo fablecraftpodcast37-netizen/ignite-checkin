@@ -1,0 +1,23 @@
+# Render Blueprint for the Ignite Prayer Network platform.
+# Render dashboard -> New -> Blueprint -> pick this repository.
+services:
+  - type: web
+    name: ignite-prayer-network
+    runtime: python
+    plan: starter            # a paid instance: Render only attaches disks to paid services
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true
+    healthCheckPath: /_stcore/health
+    disk:
+      name: ignite-data
+      mountPath: /data       # the database lives at /data/ignite_network.db
+      sizeGB: 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: ADMIN_USERNAME
+        value: admin
+      - key: ADMIN_PASSWORD
+        sync: false          # Render asks for it when you create the Blueprint
+      - key: APP_BASE_URL
+        sync: false          # e.g. https://ignite-prayer-network.onrender.com
