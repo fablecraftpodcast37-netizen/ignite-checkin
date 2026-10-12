@@ -6,7 +6,7 @@ services:
     runtime: python
     plan: starter            # a paid instance: Render only attaches disks to paid services
     buildCommand: pip install -r requirements.txt
-    startCommand: streamlit run app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true
+    startCommand: streamlit run server.py --server.port $PORT --server.address 0.0.0.0 --server.headless true
     healthCheckPath: /_stcore/health
     disk:
       name: ignite-data
@@ -18,6 +18,22 @@ services:
       - key: ADMIN_USERNAME
         value: admin
       - key: ADMIN_PASSWORD
-        sync: false          # Render asks for it when you create the Blueprint
+        sync: false          # at least 12 characters; Render asks for it. Never put it in the code.
       - key: APP_BASE_URL
         sync: false          # e.g. https://ignite-prayer-network.onrender.com
+      # Colours. These win over .streamlit/config.toml, so the look is right even if that file is out of date.
+      - key: STREAMLIT_THEME_BASE
+        value: light
+      - key: STREAMLIT_THEME_PRIMARY_COLOR
+        value: "#4B2E83"
+      - key: STREAMLIT_THEME_BACKGROUND_COLOR
+        value: "#FBF8F3"
+      - key: STREAMLIT_THEME_SECONDARY_BACKGROUND_COLOR
+        value: "#F3EEE6"
+      - key: STREAMLIT_THEME_TEXT_COLOR
+        value: "#1F1A33"
+      # Visitors never see error details or code, whatever config.toml says.
+      - key: STREAMLIT_CLIENT_SHOW_ERROR_DETAILS
+        value: none
+      - key: STREAMLIT_CLIENT_TOOLBAR_MODE
+        value: minimal

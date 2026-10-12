@@ -1,3 +1,17 @@
-ignite_network.db
-ignite_network.db-*
+# the database and its working files: never commit member data
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+# secrets
+.env
+.env.*
+.streamlit/secrets.toml
+# exports and backups made while testing
+*.xlsx
+*.csv
+backups/
+# old copies kept while editing
+app_before_*.py
 __pycache__/
+*.pyc

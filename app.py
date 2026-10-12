@@ -33,8 +33,10 @@ Where the data lives
 
 Settings (Render: Environment variables. Streamlit Cloud: Secrets)
     ADMIN_USERNAME = "admin"
-    ADMIN_PASSWORD = "IgniteAdmin2026"      # the master password; change it here
+    ADMIN_PASSWORD = <at least 12 characters, kept only in Render>
     APP_BASE_URL   = "https://your-app.onrender.com"
+  No password is written in this file. Until ADMIN_PASSWORD is set, the main
+  admin account is switched off (team accounts still work).
 
 """
 
@@ -67,7 +69,9 @@ APP_NAME = "Ignite Prayer Network"
 DB_FILENAME = "ignite_network.db"
 PERSISTENT_DIR = "/data"            # Render persistent disk mount path
 DEFAULT_ADMIN_USERNAME = "admin"
-DEFAULT_ADMIN_PASSWORD = "IgniteAdmin2026"     # change before going live (use Secrets)
+MIN_MASTER_PASSWORD = 12            # the main admin password (Render: ADMIN_PASSWORD) must be at least this long
+# SHA-256 of passwords that were once published in this code. They are refused even if set on Render.
+RETIRED_PASSWORD_HASHES = {"5eba08895fbded795fe039adcd6b4b8b3311a9cad494ed36175ed53013df6441"}
 TEAM_ROLES = {
     "Admin": "Full access: events, members, masterclass, Google Meet, exports, backups and the team",
     "Usher": "Event-day helper: live check-in list and manual check-in only",
@@ -247,6 +251,14 @@ CREATE TABLE IF NOT EXISTS activity_log (
 
 -- Simple key/value settings editable from the admin portal
 -- (e.g. the WhatsApp community link).
+-- Attempts counted for rate limiting (sign-in failures, wrong tokens, sign-ups).
+-- Kept in the database so refreshing the page or opening a new tab doesn't reset them.
+CREATE TABLE IF NOT EXISTS rate_events (
+    bucket  TEXT NOT NULL,
+    at      REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rate_events ON rate_events (bucket, at);
+
 CREATE TABLE IF NOT EXISTS settings (
     key    TEXT PRIMARY KEY,
     value  TEXT
@@ -442,7 +454,7 @@ def migrate(conn: sqlite3.Connection):
 
 # The fingerprint changes whenever the layout changes, so upgrades run after a
 # code update even though Streamlit Cloud doesn't restart the app.
-SCHEMA_VERSION = hashlib.sha1((SCHEMA + repr(MIGRATIONS) + DATA_VERSION).encode()).hexdigest()[:12]
+SCHEMA_VERSION = hashlib.sha1((SCHEMA + repr(MIGRATIONS) + DATA_VERSION).encode(), usedforsecurity=False).hexdigest()[:12]
 
 
 @st.cache_resource
@@ -457,7 +469,78 @@ def _init_db(version: str) -> bool:
 
 
 def init_db() -> bool:
-    return _init_db(SCHEMA_VERSION)
+    ok = _init_db(SCHEMA_VERSION)
+    _lock_down_db_file()
+    return ok
+
+
+@st.cache_resource(show_spinner=False)
+def _lock_down_db_file():
+    """Only the app's own user may read or write the database files."""
+    for path in (DB_PATH, DB_PATH + "-wal", DB_PATH + "-shm"):
+        try:
+            if os.path.exists(path):
+                os.chmod(path, 0o600)
+        except OSError:
+            pass
+    return True
+
+
+# ----- rate limiting -----------------------------------------------------------------
+# Limits are per connection (IP address). Many people in Ghana share one mobile-data IP,
+# and a venue's Wi-Fi puts everyone at the door on one IP, so these are generous: they
+# stop scripts and guessing, not a busy evening.
+RATE_LIMITS = {
+    "login_user": (5, 15 * 60),      # wrong passwords for one username from one connection
+    "login_ip": (20, 15 * 60),       # wrong passwords from one connection, any username
+    "gate": (30, 15 * 60),           # wrong tokens / numbers at the live-room gate
+    "new_member": (60, 10 * 60),     # new member records
+    "mc_register": (40, 10 * 60),    # masterclass enrolments
+    "meet": (120, 10 * 60),          # prayer-link joins
+}
+
+
+def client_ip() -> str:
+    """The visitor's IP. Render puts the real client first in X-Forwarded-For."""
+    try:
+        fwd = st.context.headers.get("X-Forwarded-For")
+        first = fwd.split(",")[0].strip() if isinstance(fwd, str) else ""
+        if first:
+            return first[:64]
+        ip = st.context.ip_address
+        return ip[:64] if isinstance(ip, str) and ip else "local"
+    except Exception:
+        return "local"
+
+
+def rate_count(bucket: str, window: int) -> int:
+    with closing(get_conn()) as conn:
+        return conn.execute("SELECT COUNT(*) FROM rate_events WHERE bucket = ? AND at > ?",
+                            (bucket, time.time() - window)).fetchone()[0]
+
+
+def rate_record(bucket: str):
+    now = time.time()
+    with closing(get_conn()) as conn, conn:
+        conn.execute("INSERT INTO rate_events (bucket, at) VALUES (?, ?)", (bucket, now))
+        if secrets.randbelow(50) == 0:                       # tidy up now and then
+            conn.execute("DELETE FROM rate_events WHERE at < ?", (now - 86400,))
+
+
+def rate_blocked(kind: str, key: str = "") -> bool:
+    limit, window = RATE_LIMITS[kind]
+    return rate_count(f"{kind}:{key or client_ip()}", window) >= limit
+
+
+def rate_note(kind: str, key: str = ""):
+    rate_record(f"{kind}:{key or client_ip()}")
+
+
+def clean_text(value, max_len: int = 80) -> str:
+    """Tidy free text typed on the public pages: no control characters, no markup
+    characters, single spaces, and a sensible length."""
+    text = re.sub(r"[\x00-\x1f\x7f<>\[\]`{}|\\]", " ", str(value or ""))
+    return re.sub(r"\s+", " ", text).strip()[:max_len]
 
 
 def query_df(sql: str, params=()) -> pd.DataFrame:
@@ -564,7 +647,8 @@ INVITE_NOBODY = "No one, I came on my own"
 
 
 def set_event_flag(event_id: int, column: str, value: bool):
-    assert column in ("is_open", "prereg_open")
+    if column not in ("is_open", "prereg_open"):
+        raise ValueError(f"Unknown event setting: {column}")
     with closing(get_conn()) as conn, conn:
         conn.execute(f"UPDATE events SET {column} = ? WHERE id = ?", (int(value), event_id))
 
@@ -654,9 +738,10 @@ def mc_delete_session(session_id: int) -> int:
 
 
 def new_reg_token(conn: sqlite3.Connection) -> str:
-    """IGNITE-8921 style. Four digits while there's room, then six."""
+    """IGNITE-482917 style: six digits, so tokens can't be guessed. Older four-digit
+    tokens keep working."""
     for attempt in range(60):
-        digits = 4 if attempt < 40 else 6
+        digits = 6 if attempt < 50 else 7
         token = f"IGNITE-{secrets.randbelow(9 * 10 ** (digits - 1)) + 10 ** (digits - 1)}"
         if not conn.execute("SELECT 1 FROM masterclass_registrations WHERE reg_id = ?", (token,)).fetchone():
             return token
@@ -665,9 +750,9 @@ def new_reg_token(conn: sqlite3.Connection) -> str:
 
 def normalise_token(text: str) -> str:
     t = re.sub(r"\s+", "", (text or "").upper())
-    if re.fullmatch(r"\d{4,6}", t):
+    if re.fullmatch(r"\d{4,7}", t):
         t = "IGNITE-" + t
-    if re.fullmatch(r"IGNITE\d{4,6}", t):
+    if re.fullmatch(r"IGNITE\d{4,7}", t):
         t = "IGNITE-" + t[6:]
     return t
 
@@ -713,7 +798,8 @@ def mc_log_entry(reg_id: str, session_id: int):
 
 
 def mc_set_status(reg_ids: list[str], status: str, actor: str) -> int:
-    assert status in (MC_FREE, MC_PENDING, MC_PAID)
+    if status not in (MC_FREE, MC_PENDING, MC_PAID):
+        raise ValueError(f"Unknown payment status: {status}")
     with closing(get_conn()) as conn, conn:
         n = 0
         for rid in reg_ids:
@@ -1356,9 +1442,12 @@ def events_summary() -> pd.DataFrame:
 
 
 # ----- team accounts and activity log -------------------------------------------
+PBKDF2_ITERATIONS = 600_000       # OWASP Password Storage Cheat Sheet figure for PBKDF2-HMAC-SHA256
+
+
 def hash_password(password: str) -> str:
     salt = os.urandom(16)
-    iterations = 200_000
+    iterations = PBKDF2_ITERATIONS
     digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations)
     return f"pbkdf2_sha256${iterations}${salt.hex()}${digest.hex()}"
 
@@ -1372,22 +1461,52 @@ def verify_password(password: str, stored: str) -> bool:
         return False
 
 
+def password_needs_upgrade(stored: str) -> bool:
+    """Older accounts were hashed with fewer rounds; they're upgraded at their next sign-in."""
+    try:
+        return int(stored.split("$")[1]) < PBKDF2_ITERATIONS
+    except (IndexError, ValueError, AttributeError):
+        return False
+
+
+_DUMMY_HASH = "pbkdf2_sha256$600000$" + "00" * 16 + "$" + "00" * 32
+
+
 def owner_username() -> str:
     return get_setting("ADMIN_USERNAME", DEFAULT_ADMIN_USERNAME).strip() or DEFAULT_ADMIN_USERNAME
 
 
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def master_password():
+    """The main admin password from Render (or Streamlit secrets). None when it isn't
+    set, is too short, or is one that was once published in the code."""
+    pw = get_setting("ADMIN_PASSWORD", "")
+    if len(pw) < MIN_MASTER_PASSWORD or _sha256(pw) in RETIRED_PASSWORD_HASHES:
+        return None
+    return pw
+
+
 def authenticate(username: str, password: str):
     username = (username or "").strip()
+    password = password or ""
     if username.casefold() == owner_username().casefold():
-        expected = get_setting("ADMIN_PASSWORD", DEFAULT_ADMIN_PASSWORD)
-        if hmac.compare_digest(password.encode(), expected.encode()):
+        expected = master_password()
+        # compare fixed-length digests so the check takes the same time whatever is typed
+        if expected and hmac.compare_digest(_sha256(password), _sha256(expected)):
             return {"id": 0, "name": "Main administrator", "username": owner_username(), "role": "Owner"}
         return None
     with closing(get_conn()) as conn, conn:
         row = conn.execute("SELECT * FROM admins WHERE username = ? AND is_active = 1", (username,)).fetchone()
         if row and verify_password(password, row["password_hash"]):
             conn.execute("UPDATE admins SET last_login = CURRENT_TIMESTAMP WHERE id = ?", (row["id"],))
+            if password_needs_upgrade(row["password_hash"]):
+                conn.execute("UPDATE admins SET password_hash = ? WHERE id = ?", (hash_password(password), row["id"]))
             return {"id": row["id"], "name": row["full_name"], "username": row["username"], "role": row["role"]}
+        if not row:
+            verify_password(password, _DUMMY_HASH)   # same delay whether or not the username exists
     return None
 
 
@@ -1696,8 +1815,27 @@ def first_name(full_name: str) -> str:
     return (full_name or "").strip().split(" ")[0] if full_name else ""
 
 
+_PHONE_LIKE = re.compile(r"^\+?[\d\s()-]+$")
+
+
+def spreadsheet_safe(df: pd.DataFrame) -> pd.DataFrame:
+    """Stop text typed on the public pages from running as a formula when an export
+    is opened in Excel or Google Sheets (e.g. a name like =HYPERLINK(...)).
+    Phone numbers such as +233 24 123 4567 are left alone."""
+    def fix(v):
+        if isinstance(v, str) and v[:1] in ("=", "+", "-", "@", "\t", "\r") and not _PHONE_LIKE.match(v):
+            return "'" + v
+        return v
+    out = df.copy()
+    for col in out.columns:
+        if out[col].dtype == object or str(out[col].dtype).startswith("str"):
+            out[col] = out[col].map(fix)
+    return out
+
+
 def to_excel_bytes(df: pd.DataFrame, sheet: str) -> bytes:
     sheet = (safe_filename(sheet) or "Sheet")[:31]
+    df = spreadsheet_safe(df)
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name=sheet)
@@ -2161,7 +2299,7 @@ def event_ticket(ev: dict, public: bool = True):
     )
 
 
-def fmt_clock(hhmm) -> str:
+def fmt_time_short(hhmm) -> str:
     try:
         t = datetime.strptime(str(hhmm), "%H:%M")
     except (TypeError, ValueError):
@@ -2170,7 +2308,7 @@ def fmt_clock(hhmm) -> str:
 
 
 def time_range(ev: dict) -> str:
-    start, end = fmt_clock(ev.get("start_time")), fmt_clock(ev.get("end_time"))
+    start, end = fmt_time_short(ev.get("start_time")), fmt_time_short(ev.get("end_time"))
     if start and end:
         return f"{start} – {end}"
     return start or ""
@@ -2568,7 +2706,7 @@ def phone_step(prefix: str, title: str, note: str, button: str, inviters=None):
         c1, c2 = st.columns([1, 1.5])
         country = c1.selectbox("Country", COUNTRY_NAMES, format_func=country_label, key=f"{prefix}_cc_{nonce}")
         raw = c2.text_input("Phone number", placeholder="e.g. 024 123 4567", autocomplete="tel",
-                            key=f"{prefix}_ph_{nonce}")
+                            key=f"{prefix}_ph_{nonce}", max_chars=25)
         st.caption("Tip: you can type to search the country list.")
         invited = None
         if inviters:
@@ -2605,10 +2743,10 @@ def details_step(prefix: str, pending: dict, title: str, note: str, button: str,
         st.markdown(f'<div class="ig-formtitle">{esc(title)}</div><div class="ig-formnote">{esc(note)}</div>',
                     unsafe_allow_html=True)
         st.markdown('<div class="ig-section">About you</div>', unsafe_allow_html=True)
-        full_name = st.text_input("Full name *", placeholder="e.g. Ama Serwaa Mensah", key=k("name"))
+        full_name = st.text_input("Full name *", placeholder="e.g. Ama Serwaa Mensah", key=k("name"), max_chars=80)
         gender = st.radio("Gender *", GENDERS, index=None, horizontal=True, key=k("gender"))
         c1, c2 = st.columns(2)
-        email = c1.text_input("Email", placeholder="Optional", key=k("email"))
+        email = c1.text_input("Email", placeholder="Optional", key=k("email"), max_chars=120)
         lives_in = c2.selectbox("Where do you live?", COUNTRY_NAMES, index=COUNTRY_NAMES.index(home),
                                 format_func=lambda n: f"{FLAGS.get(n, '')}  {n}", key=k("home"))
         whatsapp_raw = st.text_input("WhatsApp number", placeholder="Leave blank if it's the number above",
@@ -2622,7 +2760,7 @@ def details_step(prefix: str, pending: dict, title: str, note: str, button: str,
 
         st.markdown('<div class="ig-section">Emergency contact</div>', unsafe_allow_html=True)
         c3, c4 = st.columns(2)
-        ec_name = c3.text_input("Name *", placeholder="Who should we call?", key=k("ecn"))
+        ec_name = c3.text_input("Name *", placeholder="Who should we call?", key=k("ecn"), max_chars=80)
         ec_raw = c4.text_input("Phone *", placeholder="Their phone number", key=k("ecp"))
 
         st.markdown('<div class="ig-section">Under 18?</div>', unsafe_allow_html=True)
@@ -2641,6 +2779,7 @@ def details_step(prefix: str, pending: dict, title: str, note: str, button: str,
         return None
 
     num_country = pending["country"]
+    full_name, ec_name, email = clean_text(full_name), clean_text(ec_name), clean_text(email, 120)
     whatsapp = to_intl(whatsapp_raw, num_country) if whatsapp_raw.strip() else pending["phone"]
     ec_phone = to_intl(ec_raw, num_country)
     parent = to_intl(parent_raw, num_country) if parent_raw.strip() else ""
@@ -2676,6 +2815,11 @@ def details_step(prefix: str, pending: dict, title: str, note: str, button: str,
         if b_day and b_month and not (get_member(existing) or {}).get("birth_month"):
             set_member_birthday(existing, b_day, b_month)
         return existing
+    if rate_blocked("new_member"):
+        show_errors(["A lot of people have just signed up from this connection. Please wait a few minutes "
+                     "and try again, or ask an usher to help you."])
+        return None
+    rate_note("new_member")
     return create_member({
         "full_name": full_name.strip(), "phone_number": pending["phone"], "whatsapp_number": whatsapp,
         "email": email.strip() or None, "country": lives_in if lives_in != "Other country" else None,
@@ -2790,7 +2934,7 @@ def flyer_backdrop(ev: dict):
     flyer = get_flyer(ev["id"])
     if look not in FLYER_OVERLAY or not flyer:
         return
-    uri = flyer_backdrop_uri(ev["id"], hashlib.md5(flyer).hexdigest())
+    uri = flyer_backdrop_uri(ev["id"], hashlib.md5(flyer, usedforsecurity=False).hexdigest())
     if not uri:
         return
     a1, a2, a3 = FLYER_OVERLAY[look]
@@ -3091,7 +3235,11 @@ def deny_card(title: str, message: str, waiting: bool = False):
 def redirect_browser(url: str, label: str, key: str):
     """Send the whole browser window to the room. A same-tab button stays on
     screen in case the phone blocks the automatic jump."""
-    target = json.dumps(url)
+    if not str(url).startswith(("https://", "http://")):
+        st.error("This room link isn't set up correctly. Please tell the organisers.")
+        return
+    # json.dumps doesn't escape "<", so "</script>" in a link could end the script early
+    target = json.dumps(url).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
     script = f"""<script>
       (function () {{
         const url = {target};
@@ -3232,8 +3380,8 @@ def masterclass_page():
         st.markdown('<div class="ig-formtitle">Your details</div>'
                     '<div class="ig-formnote">Use the phone number you\'ll have with you on the day.</div>',
                     unsafe_allow_html=True)
-        name = st.text_input("Full name *", placeholder="e.g. Ama Serwaa Mensah", key=k("name"))
-        email = st.text_input("Email *", placeholder="you@example.com", key=k("email"))
+        name = st.text_input("Full name *", placeholder="e.g. Ama Serwaa Mensah", key=k("name"), max_chars=80)
+        email = st.text_input("Email *", placeholder="you@example.com", key=k("email"), max_chars=120)
         c1, c2 = st.columns([1, 1.5])
         country = c1.selectbox("Country", COUNTRY_NAMES, format_func=country_label, key=k("cc"))
         raw = c2.text_input("Phone number *", placeholder="e.g. 024 123 4567", autocomplete="tel", key=k("ph"))
@@ -3241,6 +3389,7 @@ def masterclass_page():
     if not go:
         return
     phone = to_intl(raw, country)
+    name, email = clean_text(name), clean_text(email, 120)
     errors = []
     if len(name.strip()) < 2:
         errors.append("Enter your full name.")
@@ -3254,9 +3403,12 @@ def masterclass_page():
     fresh = mc_session(sess["id"])
     if not fresh or not fresh["active_status"]:
         errors.append("Enrolment for this session has just closed.")
+    if not errors and rate_blocked("mc_register"):
+        errors.append("A lot of people have just enrolled from this connection. Please wait a few minutes and try again.")
     if errors:
         show_errors(errors)
         return
+    rate_note("mc_register")
     reg, is_new = mc_register(fresh, name, email, phone)
     st.session_state.mc_result = {"reg": reg, "session_id": fresh["id"], "is_new": is_new}
     st.session_state.form_nonce += 1
@@ -3284,14 +3436,18 @@ def live_gate_page():
     if locked > time.time():
         deny_card("Too many tries", f"Please wait {int(locked - time.time())} seconds and try again.")
         return
+    if rate_blocked("gate"):
+        deny_card("Too many tries", "Too many wrong tokens from this connection. Please wait 15 minutes, "
+                  "or message the PA on WhatsApp for help.")
+        return
 
     nonce = st.session_state.form_nonce
     with st.form(key=f"gate_form_{nonce}"):
         c1, c2 = st.columns([1, 1.6])
         country = c1.selectbox("Country (for phone numbers)", COUNTRY_NAMES, format_func=country_label,
                                key=f"gate_cc_{nonce}")
-        entry = c2.text_input("Token or phone number", placeholder="IGNITE-8921 or 024 123 4567",
-                              key=f"gate_in_{nonce}")
+        entry = c2.text_input("Token or phone number", placeholder="IGNITE-482917 or 024 123 4567",
+                              key=f"gate_in_{nonce}", max_chars=40)
         go = st.form_submit_button("Join live room", type="primary", width="stretch", icon=":material/lock_open:")
 
     choice = st.session_state.get("gate_choices")
@@ -3304,6 +3460,7 @@ def live_gate_page():
         matches = mc_lookup(entry, country)
         approved = [m for m in matches if m["payment_status"] in MC_APPROVED]
         if not approved:
+            rate_note("gate")
             st.session_state.gate_fails = st.session_state.get("gate_fails", 0) + 1
             if st.session_state.gate_fails >= MAX_LOGIN_ATTEMPTS:
                 st.session_state.gate_locked_until = time.time() + LOCKOUT_SECONDS
@@ -3380,7 +3537,7 @@ def meet_join_form(url: str):
     nonce = st.session_state.form_nonce
     with st.form(key=f"meet_form_{nonce}"):
         display = st.text_input("Your name (as it shows on Google Meet) *", placeholder="e.g. Ama Mensah",
-                                key=f"meet_nm_{nonce}")
+                                key=f"meet_nm_{nonce}", max_chars=80)
         c1, c2 = st.columns([1, 1.5])
         country = c1.selectbox("Country", COUNTRY_NAMES, format_func=country_label, key=f"meet_cc_{nonce}")
         raw = c2.text_input("Phone number *", placeholder="e.g. 024 123 4567", autocomplete="tel", key=f"meet_ph_{nonce}")
@@ -3388,6 +3545,7 @@ def meet_join_form(url: str):
     if not go:
         return
     phone = to_intl(raw, country)
+    display = clean_text(display)
     errors = []
     if len(display.strip()) < 2:
         errors.append("Enter your name.")
@@ -3396,9 +3554,12 @@ def meet_join_form(url: str):
         problem = "For other countries, start with + and the country code."
     if problem:
         errors.append(problem)
+    if not errors and rate_blocked("meet"):
+        errors.append("Too many joins from this connection just now. Please wait a minute and try again.")
     if errors:
         show_errors(errors)
         return
+    rate_note("meet")
     meet_log(display, phone)
     st.session_state.meet_go = {"url": url, "first": first_name(display),
                                 "time": datetime.now(timezone.utc).strftime("%H:%M")}
@@ -3446,13 +3607,24 @@ def admin_login():
     brand_row()
     page_heading("Admin", "Sign in", "For the Ignite team only.")
     locked_until = st.session_state.get("locked_until", 0)
-    if locked_until > time.time():
-        st.error(f"Too many attempts. Try again in {int(locked_until - time.time())} seconds.")
+    if locked_until > time.time() or rate_blocked("login_ip"):
+        wait = max(int(locked_until - time.time()), 0)
+        st.error("Too many sign-in attempts from this connection. "
+                 + (f"Try again in {wait} seconds." if wait else "Please wait 15 minutes and try again."))
+        if st.button("← Back to member page", key="back_to_public_locked", type="tertiary"):
+            leave_admin()
         return
     with st.form("admin_login", clear_on_submit=True):
-        username = st.text_input("Username", autocomplete="username")
-        pw = st.text_input("Password", type="password", autocomplete="current-password")
+        username = st.text_input("Username", autocomplete="username", max_chars=60)
+        pw = st.text_input("Password", type="password", autocomplete="current-password", max_chars=200)
         go = st.form_submit_button("Sign in", type="primary", width="stretch")
+    if master_password() is None:
+        st.caption("The main admin account is switched off until its password (at least "
+                   f"{MIN_MASTER_PASSWORD} characters) is set as ADMIN_PASSWORD on Render. Team accounts still work.")
+    user_key = f"{(username or '').strip().casefold()[:60]}|{client_ip()}"
+    if go and rate_blocked("login_user", user_key):
+        st.error("Too many wrong passwords for this username. Please wait 15 minutes and try again.")
+        go = False
     if go:
         user = authenticate(username, pw)
         if user:
@@ -3463,7 +3635,10 @@ def admin_login():
             st.rerun()
         else:
             time.sleep(1)
-            log_action(f"Failed sign-in attempt for username “{username.strip()[:40]}”", actor="Unknown")
+            rate_note("login_user", user_key)
+            rate_note("login_ip")
+            log_action(f"Failed sign-in attempt for username “{clean_text(username, 40)}” from {client_ip()}",
+                       actor="Unknown")
             st.session_state.failed_logins = st.session_state.get("failed_logins", 0) + 1
             if st.session_state.failed_logins >= MAX_LOGIN_ATTEMPTS:
                 st.session_state.locked_until = time.time() + LOCKOUT_SECONDS
@@ -3489,7 +3664,7 @@ def event_picker(label: str, key: str, events: list[dict]) -> dict:
 
 def download_pair(df: pd.DataFrame, stem: str, sheet: str, key: str):
     c1, c2 = st.columns(2)
-    c1.download_button("Export CSV", df.to_csv(index=False).encode("utf-8"), file_name=f"{stem}.csv",
+    c1.download_button("Export CSV", spreadsheet_safe(df).to_csv(index=False).encode("utf-8"), file_name=f"{stem}.csv",
                        mime="text/csv", width="stretch", key=f"{key}_csv")
     c2.download_button("Export Excel", to_excel_bytes(df, sheet), file_name=f"{stem}.xlsx",
                        mime=XLSX_MIME, width="stretch", key=f"{key}_xlsx")
@@ -3829,9 +4004,9 @@ def page_details_section(ev: dict):
         c1, c2 = st.columns(2)
         slots = [f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 15, 30, 45)]
         pick = lambda v: slots.index(v) if v in slots else None
-        start = c1.selectbox("Starts at (GMT)", slots, index=pick(ev.get("start_time")), format_func=fmt_clock,
+        start = c1.selectbox("Starts at (GMT)", slots, index=pick(ev.get("start_time")), format_func=fmt_time_short,
                              placeholder="Choose a time")
-        end = c2.selectbox("Ends at (GMT, optional)", slots, index=pick(ev.get("end_time")), format_func=fmt_clock,
+        end = c2.selectbox("Ends at (GMT, optional)", slots, index=pick(ev.get("end_time")), format_func=fmt_time_short,
                            placeholder="Choose a time")
         theme = st.text_input("Theme", value=ev.get("theme") or "", placeholder="e.g. Fire on the Altar (Leviticus 6:13)")
         about = st.text_area("A few words about the programme", value=ev.get("about") or "", height=110,
@@ -4307,7 +4482,7 @@ def import_section():
                           "email": r["Email"] or None, "country": country_from_number(r["Phone"]),
                           "emergency_contact_name": None, "emergency_contact_phone": None,
                           "parent_guardian_phone": None, "is_minor": 0, "source": "Imported",
-                          "birth_day": bday[0], "birth_month": bday[1]}[f] for f in MEMBER_FIELDS])
+                          "birth_day": bday[0], "birth_month": bday[1]}.get(f) for f in MEMBER_FIELDS])
                     added += 1
                 except sqlite3.IntegrityError:
                     pass                                   # already on the list

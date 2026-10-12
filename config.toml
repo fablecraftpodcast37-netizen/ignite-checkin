@@ -8,10 +8,17 @@ font = "sans serif"
 
 [server]
 headless = true
-maxUploadSize = 50
+maxUploadSize = 50                # MB: flyers, member lists, Meet reports, backups
+enableXsrfProtection = true       # uploads must come from the app's own pages
+enableCORS = true                 # other websites can't call the app from a browser
+enableStaticServing = false       # no folder of files is published
+fileWatcherType = "none"          # production: don't watch for code changes
+runOnSave = false
 
 [client]
-toolbarMode = "minimal"
+showErrorDetails = "none"         # visitors never see code or error details (they go to the Render log)
+showErrorLinks = false
+toolbarMode = "minimal"           # no developer menu for visitors
 
 [browser]
 gatherUsageStats = false
