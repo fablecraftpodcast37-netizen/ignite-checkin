@@ -175,7 +175,14 @@ CREATE TABLE IF NOT EXISTS events (
     prereg_deadline TEXT,                     -- 'YYYY-MM-DD HH:MM' Ghana time; pre-registration closes then
     uses_checkin INTEGER NOT NULL DEFAULT 1,  -- 0 = pre-registration only, no check-in at the venue
     created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    flyer_bytes BLOB                          -- programme flyer, stored as JPEG
+    flyer_bytes BLOB,                         -- programme flyer, stored as JPEG
+    start_time  TEXT,                         -- 'HH:MM' Ghana time, optional
+    end_time    TEXT,
+    theme       TEXT,                         -- the theme or scripture for the programme
+    about       TEXT,                         -- short description members read before registering
+    map_url     TEXT,                         -- Google Maps link; built from the venue when empty
+    rsvp_contacts TEXT,                       -- one 'Name, phone' per line
+    inviters    TEXT                          -- one name per line; asks "Who invited you?" when filled
 );
 
 CREATE TABLE IF NOT EXISTS members (
@@ -193,6 +200,7 @@ CREATE TABLE IF NOT EXISTS members (
     birth_month             INTEGER,                 -- 1-12
     sms_opt_in              INTEGER NOT NULL DEFAULT 0,  -- legacy column, no longer used
     source                  TEXT,                    -- how they joined: check-in, join link, import...
+    gender                  TEXT,
     consent_at              DATETIME,
     created_at              DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -204,6 +212,7 @@ CREATE TABLE IF NOT EXISTS attendance (
     member_id           INTEGER NOT NULL REFERENCES members(id),
     event_id            INTEGER NOT NULL REFERENCES events(id),
     check_in_timestamp  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    invited_by          TEXT,
     UNIQUE (member_id, event_id)
 );
 
@@ -213,6 +222,7 @@ CREATE TABLE IF NOT EXISTS pre_registrations (
     member_id      INTEGER NOT NULL REFERENCES members(id),
     event_id       INTEGER NOT NULL REFERENCES events(id),
     registered_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    invited_by     TEXT,
     UNIQUE (member_id, event_id)
 );
 
@@ -339,6 +349,16 @@ MIGRATIONS = [
     ("masterclass_sessions", "price_note", "TEXT"),
     ("masterclass_registrations", "approved_by", "TEXT"),
     ("masterclass_registrations", "approved_at", "DATETIME"),
+    ("events", "start_time", "TEXT"),
+    ("events", "end_time", "TEXT"),
+    ("events", "theme", "TEXT"),
+    ("events", "about", "TEXT"),
+    ("events", "map_url", "TEXT"),
+    ("events", "rsvp_contacts", "TEXT"),
+    ("events", "inviters", "TEXT"),
+    ("attendance", "invited_by", "TEXT"),
+    ("pre_registrations", "invited_by", "TEXT"),
+    ("members", "gender", "TEXT"),
 ]
 DATA_VERSION = "intl-phones-1"   # bump when a one-off data upgrade is added
 
@@ -459,6 +479,7 @@ def set_app_setting(key: str, value: str):
 # ----- events ---------------------------------------------------------------
 EVENT_COLUMNS = """e.id, e.event_name, e.event_type, e.event_date, e.venue, e.is_open,
                    e.prereg_open, e.prereg_deadline, e.uses_checkin, e.created_at, e.flyer_bytes IS NOT NULL AS has_flyer,
+                   e.start_time, e.end_time, e.theme, e.about, e.map_url, e.rsvp_contacts, e.inviters,
                    (SELECT COUNT(*) FROM attendance a WHERE a.event_id = e.id) AS attendees,
                    (SELECT COUNT(*) FROM pre_registrations p WHERE p.event_id = e.id) AS preregs"""
 
@@ -506,6 +527,40 @@ def update_event(event_id, name, event_type, event_date, venue, is_open, prereg_
              int(is_open), int(prereg_open), prereg_deadline,
              None if uses_checkin is None else int(uses_checkin), event_id),
         )
+
+
+PAGE_FIELDS = ("start_time", "end_time", "theme", "about", "map_url", "rsvp_contacts", "inviters")
+
+
+def set_event_page(event_id: int, **fields):
+    """Saves what members see about the programme. Empty text is stored as NULL."""
+    cols = [f for f in fields if f in PAGE_FIELDS]
+    vals = [(str(fields[c]).strip() or None) if fields[c] is not None else None for c in cols]
+    with closing(get_conn()) as conn, conn:
+        conn.execute(f"UPDATE events SET {', '.join(c + ' = ?' for c in cols)} WHERE id = ?", (*vals, event_id))
+
+
+def last_inviters(exclude_id: int):
+    """The most recent inviter list from another event, so it doesn't have to be typed again."""
+    with closing(get_conn()) as conn:
+        row = conn.execute("""SELECT event_name, inviters FROM events
+                              WHERE id <> ? AND COALESCE(inviters, '') <> '' ORDER BY id DESC LIMIT 1""",
+                           (exclude_id,)).fetchone()
+        return (row["event_name"], row["inviters"]) if row else (None, "")
+
+
+def split_lines(text) -> list[str]:
+    seen, out = set(), []
+    for line in str(text or "").splitlines():
+        line = line.strip(" \t-•")
+        if line and line.lower() not in seen:
+            seen.add(line.lower())
+            out.append(line)
+    return out
+
+
+INVITE_SOMEONE_ELSE = "Someone else"
+INVITE_NOBODY = "No one, I came on my own"
 
 
 def set_event_flag(event_id: int, column: str, value: bool):
@@ -1072,7 +1127,7 @@ def meet_full_export() -> pd.DataFrame:
 # ----- members ---------------------------------------------------------------
 MEMBER_FIELDS = ("full_name", "phone_number", "whatsapp_number", "email", "country",
                  "emergency_contact_name", "emergency_contact_phone", "parent_guardian_phone",
-                 "is_minor", "source", "birth_day", "birth_month")
+                 "is_minor", "source", "birth_day", "birth_month", "gender")
 
 
 def find_member_id(phone: str):
@@ -1157,6 +1212,7 @@ def member_countries() -> list[str]:
 def all_members_export() -> pd.DataFrame:
     return query_df(
         """SELECT m.full_name AS "Full Name", m.phone_number AS "Phone",
+                  COALESCE(m.gender, '') AS "Gender",
                   m.whatsapp_number AS "WhatsApp", m.email AS "Email", m.country AS "Country",
                   m.birth_day, m.birth_month,
                   CASE WHEN m.is_minor THEN 'Yes' ELSE '' END AS "Under 18",
@@ -1192,20 +1248,21 @@ def server_checkin_time(member_id: int, event_id: int) -> str:
         return row["t"] if row else datetime.now(timezone.utc).strftime("%H:%M:%S")
 
 
-def record_check_in(member_id: int, event_id: int) -> bool:
+def record_check_in(member_id: int, event_id: int, invited_by=None) -> bool:
     try:
         with closing(get_conn()) as conn, conn:
-            conn.execute("INSERT INTO attendance (member_id, event_id) VALUES (?, ?)", (member_id, event_id))
+            conn.execute("INSERT INTO attendance (member_id, event_id, invited_by) VALUES (?, ?, ?)",
+                         (member_id, event_id, invited_by or None))
         return True
     except sqlite3.IntegrityError:
         return False
 
 
-def record_pre_registration(member_id: int, event_id: int) -> bool:
+def record_pre_registration(member_id: int, event_id: int, invited_by=None) -> bool:
     try:
         with closing(get_conn()) as conn, conn:
-            conn.execute("INSERT INTO pre_registrations (member_id, event_id) VALUES (?, ?)",
-                         (member_id, event_id))
+            conn.execute("INSERT INTO pre_registrations (member_id, event_id, invited_by) VALUES (?, ?, ?)",
+                         (member_id, event_id, invited_by or None))
         return True
     except sqlite3.IntegrityError:
         return False
@@ -1217,7 +1274,7 @@ def is_pre_registered(member_id: int, event_id: int) -> bool:
                             (member_id, event_id)).fetchone() is not None
 
 
-PEOPLE_COLUMNS = """m.full_name AS "Full Name", m.phone_number AS "Phone",
+PEOPLE_COLUMNS = """m.full_name AS "Full Name", COALESCE(m.gender, '') AS "Gender", m.phone_number AS "Phone",
                     m.whatsapp_number AS "WhatsApp", m.email AS "Email", COALESCE(m.country, '') AS "Country",
                     CASE WHEN m.is_minor THEN 'Yes' ELSE '' END AS "Under 18",
                     m.parent_guardian_phone AS "Parent/Guardian Phone",
@@ -1231,7 +1288,8 @@ def get_ledger(event_id: int) -> pd.DataFrame:
                    {PEOPLE_COLUMNS},
                    CASE WHEN p.id IS NOT NULL THEN 'Yes' ELSE '' END AS "Pre-Registered",
                    CASE WHEN a.id = (SELECT MIN(a2.id) FROM attendance a2 WHERE a2.member_id = a.member_id)
-                        THEN 'Yes' ELSE '' END AS "First Visit"
+                        THEN 'Yes' ELSE '' END AS "First Visit",
+                   COALESCE(a.invited_by, p.invited_by, '') AS "Invited By"
             FROM attendance a
             JOIN members m ON m.id = a.member_id
             LEFT JOIN pre_registrations p ON p.member_id = a.member_id AND p.event_id = a.event_id
@@ -1247,7 +1305,8 @@ def get_prereg_ledger(event_id: int) -> pd.DataFrame:
     df = query_df(
         f"""SELECT strftime('%Y-%m-%d %H:%M:%S', p.registered_at) AS "Registered At",
                    {PEOPLE_COLUMNS},
-                   COALESCE(strftime('%Y-%m-%d %H:%M:%S', a.check_in_timestamp), '') AS "Arrived At"
+                   COALESCE(strftime('%Y-%m-%d %H:%M:%S', a.check_in_timestamp), '') AS "Arrived At",
+                   COALESCE(p.invited_by, '') AS "Invited By"
             FROM pre_registrations p
             JOIN members m ON m.id = p.member_id
             LEFT JOIN attendance a ON a.member_id = p.member_id AND a.event_id = p.event_id
@@ -2102,10 +2161,140 @@ def event_ticket(ev: dict, public: bool = True):
     )
 
 
+def fmt_clock(hhmm) -> str:
+    try:
+        t = datetime.strptime(str(hhmm), "%H:%M")
+    except (TypeError, ValueError):
+        return ""
+    return t.strftime("%I:%M %p").lstrip("0") if t.minute else t.strftime("%I %p").lstrip("0")
+
+
+def time_range(ev: dict) -> str:
+    start, end = fmt_clock(ev.get("start_time")), fmt_clock(ev.get("end_time"))
+    if start and end:
+        return f"{start} – {end}"
+    return start or ""
+
+
+def map_link(ev: dict) -> str:
+    url = (ev.get("map_url") or "").strip()
+    if url.startswith("http"):
+        return url
+    if ev.get("venue"):
+        return "https://www.google.com/maps/search/?api=1&query=" + quote(ev["venue"])
+    return ""
+
+
+def calendar_link(ev: dict) -> str:
+    """Google Calendar 'add event' link. Ghana time is UTC, so times go in as Z."""
+    if not ev.get("event_date"):
+        return ""
+    try:
+        d = date.fromisoformat(ev["event_date"])
+    except ValueError:
+        return ""
+    try:
+        start = datetime.combine(d, datetime.strptime(ev["start_time"], "%H:%M").time())
+        try:
+            end = datetime.combine(d, datetime.strptime(ev["end_time"], "%H:%M").time())
+            if end <= start:
+                end += timedelta(days=1)
+        except (TypeError, ValueError):
+            end = start + timedelta(hours=3)
+        dates = f"{start:%Y%m%dT%H%M%SZ}/{end:%Y%m%dT%H%M%SZ}"
+    except (TypeError, ValueError):
+        dates = f"{d:%Y%m%d}/{d + timedelta(days=1):%Y%m%d}"
+    details = " ".join(x for x in (ev.get("theme"), ev.get("about")) if x)[:900]
+    return ("https://calendar.google.com/calendar/render?action=TEMPLATE"
+            f"&text={quote(ev['event_name'])}&dates={dates}"
+            f"&location={quote(ev.get('venue') or '')}&details={quote(details)}")
+
+
+def parse_contacts(text) -> list[tuple[str, str]]:
+    """'Brother Kofi, 024 123 4567' (or with a dash, colon or just a space) -> (name, phone)."""
+    out = []
+    for line in split_lines(text):
+        m = re.match(r"^(.*?)[\s,:\-–]*(\+?[\d][\d\s()-]{6,})$", line)
+        if m and m.group(1).strip():
+            out.append((m.group(1).strip(" ,:-–"), m.group(2).strip()))
+        elif m:
+            out.append(("Call us", m.group(2).strip()))
+        else:
+            out.append((line, ""))
+    return out
+
+
+ICON_CAL = ('<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M7 2h2v2h6V2h2v2h2a2 2 0 0 1 2 2v13'
+            'a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2V2zm12 8H5v9h14v-9z"/></svg>')
+ICON_BOOK = ('<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M6 2h12a2 2 0 0 1 2 2v16a2 2 0 0 1-2 2'
+             'H6a3 3 0 0 1-3-3V5a3 3 0 0 1 3-3zm0 15a1 1 0 0 0 0 2h12v-2H6zm3-11v2h6V6H9z"/></svg>')
+ICON_SPARK = ('<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2l2.4 6.6L21 11l-6.6 2.4L12 20'
+              'l-2.4-6.6L3 11l6.6-2.4z"/></svg>')
+ICON_CALL = ('<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M6.6 10.8a15.1 15.1 0 0 0 6.6 6.6'
+             'l2.2-2.2a1 1 0 0 1 1-.25 11.4 11.4 0 0 0 3.6.57 1 1 0 0 1 1 1V20a1 1 0 0 1-1 1A17 17 0 0 1 3 4a1 1 0 0 1 1-1'
+             'h3.5a1 1 0 0 1 1 1c0 1.25.2 2.45.57 3.57a1 1 0 0 1-.25 1z"/></svg>')
+ICON_MAP = ('<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2a7 7 0 0 1 7 7c0 5.25-7 13-7 13'
+            'S5 14.25 5 9a7 7 0 0 1 7-7zm0 4.5A2.5 2.5 0 1 0 12 11.5 2.5 2.5 0 0 0 12 6.5z"/></svg>')
+
+
+def event_info_card(ev: dict):
+    """What GatherWell-style pages show above the form: when, where, theme, a few words about it,
+    and who to call. Only the parts the team filled in are shown."""
+    rows = []
+    when = []
+    if ev.get("event_date"):
+        try:
+            when.append(date.fromisoformat(ev["event_date"]).strftime("%A, %d %B %Y").replace(", 0", ", "))
+        except ValueError:
+            pass
+    if time_range(ev):
+        when.append(time_range(ev) + " GMT")
+    cal = calendar_link(ev)
+    if when:
+        add = f'<a class="ig-info-link" href="{esc(cal)}" target="_blank" rel="noopener">Add to my calendar</a>' if cal else ""
+        rows.append(("Date & time", ICON_CAL, "<br>".join(esc(w) for w in when) + add))
+    if ev.get("venue"):
+        maps = map_link(ev)
+        link = (f'<a class="ig-info-link" href="{esc(maps)}" target="_blank" rel="noopener">Open in Google Maps</a>'
+                if maps else "")
+        rows.append(("Venue", ICON_MAP, esc(ev["venue"]) + link))
+    if ev.get("theme"):
+        rows.append(("Theme", ICON_SPARK, f'<span class="ig-info-theme">{esc(ev["theme"])}</span>'))
+    if ev.get("about"):
+        rows.append(("About", ICON_BOOK, esc(ev["about"]).replace("\n", "<br>")))
+    contacts = parse_contacts(ev.get("rsvp_contacts"))
+    if contacts:
+        people = []
+        for name, phone in contacts:
+            if phone:
+                intl = to_intl(phone)
+                digits = re.sub(r"\D", "", intl)
+                people.append(
+                    f'<div class="ig-rsvp"><div><div class="n">{esc(name)}</div><div class="p">{esc(fmt_phone(intl) or phone)}</div></div>'
+                    f'<div class="ig-rsvp-acts"><a href="tel:{esc(intl)}" aria-label="Call {esc(name)}">{ICON_CALL}</a>'
+                    f'<a class="wa" href="https://wa.me/{digits}" target="_blank" rel="noopener" '
+                    f'aria-label="WhatsApp {esc(name)}">WhatsApp</a></div></div>')
+            else:
+                people.append(f'<div class="ig-rsvp"><div class="n">{esc(name)}</div></div>')
+        rows.append(("Questions? Talk to", ICON_CALL, "".join(people)))
+    if not rows:
+        return
+    body = "".join(f'<div class="ig-info-row"><div class="ig-info-ico">{ico}</div><div class="ig-info-txt">'
+                   f'<div class="ig-info-k">{esc(k)}</div><div class="ig-info-v">{v}</div></div></div>'
+                   for k, ico, v in rows)
+    st.markdown(f'<div class="ig-info">{body}</div>', unsafe_allow_html=True)
+
+
+SAFE_LINE = ('<div class="ig-safe"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2a5 5 0 0 1 '
+             '5 5v3h1a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2h1V7a5 5 0 0 1 5-5zm0 2a3 3 0 0 0-3 3v3'
+             'h6V7a3 3 0 0 0-3-3z"/></svg>Your details stay private. Only the Ignite team can see them.</div>')
+
+
 # ---------------------------------------------------------------------------
 # Public pages: shared pieces
 # ---------------------------------------------------------------------------
 FLOW_PREFIXES = ("chk", "reg", "join")
+GENDERS = ["Female", "Male"]
 
 
 # ---------------------------------------------------------------------------
@@ -2337,14 +2526,11 @@ def show_confirmation() -> bool:
     secs = c.get("seconds", CONFIRM_SECONDS)
     bar = f'<div class="ig-bar" style="--secs:{secs}s"><i></i></div>' if c.get("auto_reset") else ""
     st.markdown(
-        f"""<div class="{css}">
-              <div class="ig-done-seal">{seal}</div>
-              <div class="ig-done-kicker">Submitted · thank you</div>
-              <h2>{esc(c['title'])}</h2>
-              <p>{esc(c['message'])}</p>
-              <div class="ig-done-meta">{esc(c['context'])} &nbsp;·&nbsp; recorded {esc(c['time'])} GMT (server time)</div>
-              {bar}
-            </div>""",
+        (f'<div class="{css}"><div class="ig-done-seal">{seal}</div>'
+         '<div class="ig-done-kicker">Submitted · thank you</div>'
+         f"<h2>{esc(c['title'])}</h2><p>{esc(c['message'])}</p>"
+         f"<div class=\"ig-done-meta\">{esc(c['context'])} &nbsp;·&nbsp; recorded {esc(c['time'])} GMT (server time)</div>"
+         f"{bar}</div>"),
         unsafe_allow_html=True,
     )
     scroll_to_top()
@@ -2372,8 +2558,9 @@ def show_errors(errors: list[str]):
     st.error("**Please check the following:**\n\n" + "\n".join(f"- {e}" for e in errors))
 
 
-def phone_step(prefix: str, title: str, note: str, button: str):
-    """Step 1: the phone number. Returns {"phone", "country"} or None."""
+def phone_step(prefix: str, title: str, note: str, button: str, inviters=None):
+    """Step 1: the phone number. Returns {"phone", "country", "invited_by"} or None.
+    When the event has an inviter list, it also asks who invited them (optional)."""
     nonce = st.session_state.form_nonce
     with st.form(key=f"{prefix}_phone_form_{nonce}"):
         st.markdown(f'<div class="ig-formtitle">{esc(title)}</div><div class="ig-formnote">{esc(note)}</div>',
@@ -2382,7 +2569,13 @@ def phone_step(prefix: str, title: str, note: str, button: str):
         country = c1.selectbox("Country", COUNTRY_NAMES, format_func=country_label, key=f"{prefix}_cc_{nonce}")
         raw = c2.text_input("Phone number", placeholder="e.g. 024 123 4567", autocomplete="tel",
                             key=f"{prefix}_ph_{nonce}")
+        st.caption("Tip: you can type to search the country list.")
+        invited = None
+        if inviters:
+            invited = st.selectbox("Who invited you?", inviters + [INVITE_SOMEONE_ELSE, INVITE_NOBODY], index=None,
+                                   placeholder="Choose a name (optional)", key=f"{prefix}_inv_{nonce}")
         go = st.form_submit_button(button, type="primary", width="stretch")
+        st.markdown(SAFE_LINE, unsafe_allow_html=True)
     if not go:
         return None
     phone = to_intl(raw, country)
@@ -2392,7 +2585,8 @@ def phone_step(prefix: str, title: str, note: str, button: str):
     if problem:
         show_errors([problem])
         return None
-    return {"phone": phone, "country": country if country != "Other country" else country_from_number(phone)}
+    return {"phone": phone, "country": country if country != "Other country" else country_from_number(phone),
+            "invited_by": invited if invited and invited != INVITE_NOBODY else (INVITE_NOBODY if invited else None)}
 
 
 def details_step(prefix: str, pending: dict, title: str, note: str, button: str, source: str):
@@ -2412,6 +2606,7 @@ def details_step(prefix: str, pending: dict, title: str, note: str, button: str,
                     unsafe_allow_html=True)
         st.markdown('<div class="ig-section">About you</div>', unsafe_allow_html=True)
         full_name = st.text_input("Full name *", placeholder="e.g. Ama Serwaa Mensah", key=k("name"))
+        gender = st.radio("Gender *", GENDERS, index=None, horizontal=True, key=k("gender"))
         c1, c2 = st.columns(2)
         email = c1.text_input("Email", placeholder="Optional", key=k("email"))
         lives_in = c2.selectbox("Where do you live?", COUNTRY_NAMES, index=COUNTRY_NAMES.index(home),
@@ -2441,6 +2636,7 @@ def details_step(prefix: str, pending: dict, title: str, note: str, button: str,
             "emergency contact or parent/guardian if needed. *", key=k("consent"))
         st.caption("For numbers in another country, start with + and the country code.")
         go = st.form_submit_button(button, type="primary", width="stretch")
+        st.markdown(SAFE_LINE, unsafe_allow_html=True)
     if not go:
         return None
 
@@ -2452,6 +2648,8 @@ def details_step(prefix: str, pending: dict, title: str, note: str, button: str,
     errors = []
     if len(full_name.strip()) < 2:
         errors.append("Enter your full name.")
+    if not gender:
+        errors.append("Choose your gender.")
     if email.strip() and not is_valid_email(email):
         errors.append("The email address doesn't look right.")
     if whatsapp_raw.strip() and phone_problem(whatsapp):
@@ -2483,12 +2681,81 @@ def details_step(prefix: str, pending: dict, title: str, note: str, button: str,
         "email": email.strip() or None, "country": lives_in if lives_in != "Other country" else None,
         "emergency_contact_name": ec_name.strip(), "emergency_contact_phone": ec_phone,
         "parent_guardian_phone": parent or None, "is_minor": int(is_minor),
-        "source": source, "birth_day": b_day, "birth_month": b_month,
+        "source": source, "birth_day": b_day, "birth_month": b_month, "gender": gender,
     })
+
+
+INFO_CSS = f"""<style>
+/* ---- event information card ---- */
+.ig-info {{ background:#fff; border:1px solid var(--line); border-radius:18px; padding:.35rem 1.1rem; margin:.2rem 0 1rem;
+           box-shadow:0 12px 30px -26px rgba(31,26,51,.45); }}
+.ig-info-row {{ display:flex; gap:.85rem; padding:.85rem 0; border-top:1px solid var(--line); }}
+.ig-info-row:first-child {{ border-top:none; }}
+.ig-info-ico {{ flex:0 0 2.3rem; height:2.3rem; border-radius:12px; display:flex; align-items:center; justify-content:center;
+               background:linear-gradient(135deg, rgba(75,46,131,.12), rgba(201,162,75,.18)); color:var(--royal); }}
+.ig-info-ico svg {{ width:1.15rem; height:1.15rem; }}
+.ig-info-txt {{ min-width:0; flex:1; }}
+.ig-info-k {{ font-size:.66rem; font-weight:700; letter-spacing:.16em; text-transform:uppercase; color:var(--gold-text); }}
+.ig-info-v {{ color:var(--ink); font-size:.95rem; line-height:1.5; margin-top:.15rem; overflow-wrap:anywhere; }}
+.ig-info-theme {{ font-family:'Cormorant Garamond', Georgia, serif; font-size:1.2rem; font-weight:700; font-style:italic; }}
+a.ig-info-link {{ display:inline-block; margin-top:.35rem; font-size:.85rem; font-weight:700; color:var(--royal) !important;
+                 text-decoration:none; border-bottom:1.5px solid rgba(75,46,131,.3); }}
+.ig-info-v a.ig-info-link {{ display:table; }}
+.ig-rsvp {{ display:flex; align-items:center; justify-content:space-between; gap:.6rem; background:var(--sand);
+           border-radius:12px; padding:.55rem .75rem; margin:.4rem 0; }}
+.ig-rsvp .n {{ font-weight:700; color:var(--ink); }}
+.ig-rsvp .p {{ font-size:.85rem; color:var(--muted); }}
+.ig-rsvp-acts {{ display:flex; gap:.4rem; flex-shrink:0; }}
+.ig-rsvp-acts a {{ display:inline-flex; align-items:center; justify-content:center; height:2.1rem; min-width:2.1rem;
+                  border-radius:10px; background:#fff; border:1px solid var(--line); color:var(--royal) !important;
+                  text-decoration:none; font-size:.8rem; font-weight:700; padding:0 .55rem; }}
+.ig-rsvp-acts a svg {{ width:1rem; height:1rem; }}
+.ig-rsvp-acts a.wa {{ background:#1E7B47; border-color:#1E7B47; color:#fff !important; }}
+.ig-safe {{ display:flex; align-items:center; justify-content:center; gap:.35rem; color:var(--muted); font-size:.8rem;
+           margin-top:.55rem; }}
+.ig-safe svg {{ width:.85rem; height:.85rem; color:var(--gold-text); }}
+
+</style>"""
+
+MOTION_CSS = f"""<style>
+/* ---- section labels get a small gold marker ---- */
+.ig-section {{ display:flex; align-items:center; gap:.5rem; }}
+.ig-section::before {{ content:""; width:.55rem; height:.55rem; border-radius:3px; transform:rotate(45deg);
+                      background:linear-gradient(135deg, var(--gold), var(--flame)); flex-shrink:0; }}
+
+/* ---- buttons: deeper gradient, soft glow, a little lift ---- */
+.stApp [data-testid="stBaseButton-primary"], .stApp [data-testid="stBaseButton-primaryFormSubmit"] {{
+    background:linear-gradient(135deg, #5B37A0 0%, var(--royal) 50%, var(--royal-dark) 100%) !important;
+    border:none !important; box-shadow:0 14px 26px -14px rgba(75,46,131,.85), inset 0 1px 0 rgba(255,255,255,.18);
+    transition:transform .18s ease, box-shadow .18s ease, filter .18s ease; }}
+.stApp [data-testid="stBaseButton-primary"]:hover, .stApp [data-testid="stBaseButton-primaryFormSubmit"]:hover {{
+    transform:translateY(-1px); filter:brightness(1.06);
+    box-shadow:0 18px 30px -14px rgba(75,46,131,.9), 0 0 0 3px rgba(201,162,75,.25); }}
+.stApp [data-testid="stBaseButton-primary"]:active, .stApp [data-testid="stBaseButton-primaryFormSubmit"]:active {{
+    transform:scale(.98); }}
+[data-baseweb="input"]:focus-within, [data-baseweb="select"] > div:focus-within, [data-baseweb="textarea"]:focus-within {{
+    box-shadow:0 0 0 3px rgba(75,46,131,.14) !important; border-color:var(--royal) !important;
+    transition:box-shadow .2s ease; }}
+
+/* ---- entrance motion: things rise in gently, one after another ---- */
+@keyframes igRise {{ from {{ opacity:0; transform:translateY(14px); }} to {{ opacity:1; transform:none; }} }}
+@keyframes igSettle {{ from {{ opacity:0; transform:scale(1.03); }} to {{ opacity:1; transform:none; }} }}
+.st-key-flyer_banner img {{ animation:igSettle .7s cubic-bezier(.2,.7,.2,1) both; }}
+.ig-kicker, .ig-h1, .ig-lead {{ animation:igRise .55s cubic-bezier(.2,.7,.2,1) both; }}
+.ig-h1 {{ animation-delay:.05s; }} .ig-lead {{ animation-delay:.1s; }}
+.ig-ticket {{ animation:igRise .55s .14s cubic-bezier(.2,.7,.2,1) both; }}
+.ig-info {{ animation:igRise .55s .2s cubic-bezier(.2,.7,.2,1) both; }}
+.ig-note {{ animation:igRise .5s .24s cubic-bezier(.2,.7,.2,1) both; }}
+[data-testid="stForm"] {{ animation:igRise .6s .28s cubic-bezier(.2,.7,.2,1) both; }}
+@media (prefers-reduced-motion: reduce) {{
+  .stApp *, .stApp *::before {{ animation:none !important; transition:none !important; }}
+}}
+</style>"""
 
 
 def page_top():
     """Flyer slot at the very top, then the brand. Returns the flyer slot."""
+    st.markdown(INFO_CSS + MOTION_CSS, unsafe_allow_html=True)
     banner = st.container(key="flyer_banner")
     brand_row()
     return banner
@@ -2592,9 +2859,9 @@ def resolve_checkin_event():
     return by_id[st.selectbox("Which programme are you attending?", ids, format_func=lambda i: public_label(by_id[i]))]
 
 
-def complete_checkin(member_id: int, ev: dict, is_new: bool):
+def complete_checkin(member_id: int, ev: dict, is_new: bool, invited_by=None):
     context = ev["event_name"]
-    if record_check_in(member_id, ev["id"]):
+    if record_check_in(member_id, ev["id"], invited_by):
         if is_new:
             msg = "Your details are saved and your arrival is recorded. Next time, your phone number is all you need."
         elif is_pre_registered(member_id, ev["id"]):
@@ -2624,6 +2891,7 @@ def checkin_page():
         return
     page_heading("Arrival check-in", "Welcome. Let's get you checked in.")
     event_ticket(ev)
+    event_info_card(ev)
     if not ev["is_open"]:
         st.markdown('<div class="ig-note">Check-in for this programme is closed. '
                     'Please speak to an usher if you need help.</div>', unsafe_allow_html=True)
@@ -2633,11 +2901,11 @@ def checkin_page():
     if pending is None:
         found = phone_step("chk", "Your phone number",
                            "Enter the number you use with Ignite. If it's your first time, we'll ask for a few details next.",
-                           "Continue")
+                           "Continue", split_lines(ev.get("inviters")))
         if found:
             member_id = find_member_id(found["phone"])
             if member_id:
-                complete_checkin(member_id, ev, is_new=False)
+                complete_checkin(member_id, ev, is_new=False, invited_by=found.get("invited_by"))
             else:
                 st.session_state.chk_pending = found
                 st.rerun()
@@ -2648,7 +2916,7 @@ def checkin_page():
             "Fill this in once and next time your number is all you need.",
             "Save & check me in", source="Check-in")
         if member_id:
-            complete_checkin(member_id, ev, is_new=True)
+            complete_checkin(member_id, ev, is_new=True, invited_by=pending.get("invited_by"))
 
 
 # ---------------------------------------------------------------------------
@@ -2662,7 +2930,7 @@ def prereg_closed_note(ev: dict):
                 '</div>', unsafe_allow_html=True)
 
 
-def complete_prereg(member_id: int, ev: dict):
+def complete_prereg(member_id: int, ev: dict, invited_by=None):
     fresh = get_event(ev["id"]) or ev          # the deadline may have passed while they were typing
     if not fresh["prereg_open"] or prereg_deadline_passed(fresh):
         late = ("Registration for this programme closed before your details came in. You're still welcome: "
@@ -2670,7 +2938,7 @@ def complete_prereg(member_id: int, ev: dict):
                 "Registration for this programme closed before your details came in, so we couldn't add you.")
         confirm_and_reset("info", "Pre-registration has closed", late, ev["event_name"], auto_reset=False)
         return
-    if record_pre_registration(member_id, ev["id"]):
+    if record_pre_registration(member_id, ev["id"], invited_by):
         done = ("On the day, scan the QR code at the entrance and enter your phone number to check in."
                 if fresh.get("uses_checkin", 1) else
                 "You're on the list, and there's nothing else you need to do. We look forward to seeing you.")
@@ -2695,6 +2963,7 @@ def register_page():
     show_flyer(banner, ev)
     page_heading("Pre-registration", "Reserve your place", "Let us know you're coming so we can prepare for you.")
     event_ticket(ev)
+    event_info_card(ev)
     if not ev["prereg_open"]:
         st.markdown('<div class="ig-note">This programme doesn\'t need pre-registration. Just come along on the day '
                     'and scan the QR code at the entrance to check in.</div>', unsafe_allow_html=True)
@@ -2710,11 +2979,11 @@ def register_page():
     if pending is None:
         found = phone_step("reg", "Your phone number",
                            "Enter the number you use with Ignite. If we don't have it yet, we'll ask for a few details next.",
-                           "Continue")
+                           "Continue", split_lines(ev.get("inviters")))
         if found:
             member_id = find_member_id(found["phone"])
             if member_id:
-                complete_prereg(member_id, ev)
+                complete_prereg(member_id, ev, found.get("invited_by"))
             else:
                 st.session_state.reg_pending = found
                 st.rerun()
@@ -2723,7 +2992,7 @@ def register_page():
                                  "We don't have this number yet. Fill this in once and it's saved for every programme.",
                                  "Reserve my place", source="Pre-registration")
         if member_id:
-            complete_prereg(member_id, ev)
+            complete_prereg(member_id, ev, pending.get("invited_by"))
     if ev.get("uses_checkin", 1):
         st.markdown('<div class="ig-note">This reserves your place. It isn\'t your check-in: on the day, '
                     'scan the QR code at the entrance to confirm you\'ve arrived.</div>', unsafe_allow_html=True)
@@ -3470,7 +3739,9 @@ def prereg_section(ev: dict, base):
         return
     link = register_link(base, ev["id"])
     when = f" on {fmt_date(ev['event_date'])}" if ev["event_date"] else ""
+    when += f", {time_range(ev)} GMT" if time_range(ev) else ""
     where = f" at {ev['venue']}" if ev["venue"] else ""
+    where += f"\nTheme: {ev['theme']}" if ev.get("theme") else ""
     closes = (f"Registration closes {fmt_deadline(ev['prereg_deadline'])}.\n\n"
               if ev.get("prereg_deadline") and not prereg_deadline_passed(ev) else "")
     on_the_day = ("" if prereg_only else
@@ -3548,6 +3819,68 @@ def details_section(ev: dict):
             st.rerun()
 
 
+def page_details_section(ev: dict):
+    st.caption("This is the information card members see under the flyer on the registration and check-in pages. "
+               "Fill in only what you need. Anything left empty simply doesn't show.")
+    copied_from, old_list = (None, "")
+    if not ev.get("inviters"):
+        copied_from, old_list = last_inviters(ev["id"])
+    with st.form(f"page_details_{ev['id']}"):
+        c1, c2 = st.columns(2)
+        slots = [f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 15, 30, 45)]
+        pick = lambda v: slots.index(v) if v in slots else None
+        start = c1.selectbox("Starts at (GMT)", slots, index=pick(ev.get("start_time")), format_func=fmt_clock,
+                             placeholder="Choose a time")
+        end = c2.selectbox("Ends at (GMT, optional)", slots, index=pick(ev.get("end_time")), format_func=fmt_clock,
+                           placeholder="Choose a time")
+        theme = st.text_input("Theme", value=ev.get("theme") or "", placeholder="e.g. Fire on the Altar (Leviticus 6:13)")
+        about = st.text_area("A few words about the programme", value=ev.get("about") or "", height=110,
+                             placeholder="What is happening, who should come, what to bring...")
+        map_url = st.text_input("Google Maps link (optional)", value=ev.get("map_url") or "",
+                                help="Paste the share link from Google Maps. If you leave it empty, members get a "
+                                     "map search for the venue name instead.")
+        rsvp = st.text_area("Contacts for questions (one per line)", value=ev.get("rsvp_contacts") or "", height=90,
+                            placeholder="Brother Kofi, 024 123 4567\nSister Ama, 055 765 4321")
+        st.markdown("**Who invited you?**")
+        inviters = st.text_area("Names members can choose from (one per line). Leave empty to not ask.",
+                                value=ev.get("inviters") or old_list, height=110,
+                                placeholder="Pastor Daniel\nEvangelist Grace\nUsher team")
+        if copied_from:
+            st.caption(f"Filled in from “{copied_from}”. Press Save to use the same list here, or clear it.")
+        st.caption("Members can also pick “Someone else” or “No one, I came on my own”. The answer shows in the "
+                   "pre-registration and check-in lists, with a count per name.")
+        save = st.form_submit_button("Save", type="primary")
+    if save:
+        if start is None and end is not None:
+            st.error("Add a start time as well, or clear the end time.")
+            return
+        if map_url.strip() and not map_url.strip().startswith("http"):
+            st.error("The map link should start with https://")
+            return
+        set_event_page(ev["id"], start_time=start or "", end_time=end or "", theme=theme, about=about,
+                       map_url=map_url, rsvp_contacts=rsvp, inviters="\n".join(split_lines(inviters)))
+        notify(f"Saved what members see for “{ev['event_name']}”.")
+        st.rerun()
+    st.markdown("**Preview**")
+    st.markdown(INFO_CSS, unsafe_allow_html=True)
+    event_ticket(ev)
+    event_info_card(ev)
+
+
+def invited_summary(df: pd.DataFrame, what: str):
+    """How many people each inviter brought."""
+    if df.empty or "Invited By" not in df:
+        return
+    named = df[df["Invited By"] != ""]
+    if named.empty:
+        return
+    with st.expander(f":material/group_add: Who invited people · {len(named)} of {len(df)} answered"):
+        counts = (named["Invited By"].value_counts().rename_axis("Invited By").reset_index(name=what))
+        c1, c2 = st.columns([1, 1.4])
+        c1.dataframe(counts, hide_index=True, width="stretch")
+        c2.bar_chart(counts.set_index("Invited By"), color=ROYAL, horizontal=True)
+
+
 def flyer_section(ev: dict):
     current = get_flyer(ev["id"])
     if current:
@@ -3615,15 +3948,18 @@ def events_tab():
     event_ticket(ev, public=False)
     with st.expander("App address used in links and QR codes", expanded=not base_url_ok(current_base_url())):
         base = base_url_input()
-    t_reg, t_chk, t_details, t_flyer, t_delete = st.tabs(
+    t_reg, t_chk, t_details, t_page, t_flyer, t_delete = st.tabs(
         [":material/link: Pre-registration link", ":material/qr_code_2: Check-in QR & poster",
-         ":material/edit: Edit details", ":material/image: Flyer", ":material/delete: Delete"])
+         ":material/edit: Edit details", ":material/article: What members see", ":material/image: Flyer",
+         ":material/delete: Delete"])
     with t_reg:
         prereg_section(ev, base)
     with t_chk:
         checkin_qr_section(ev, base)
     with t_details:
         details_section(ev)
+    with t_page:
+        page_details_section(ev)
     with t_flyer:
         flyer_section(ev)
     with t_delete:
@@ -3649,6 +3985,7 @@ def prereg_tab():
         if ev.get("prereg_deadline"):
             c2.markdown(f"**Registration {'closed' if prereg_deadline_passed(ev) else 'closes'}**  \n"
                         f"{fmt_deadline(ev['prereg_deadline'])}")
+        invited_summary(df, "Registered")
         view = filter_people(df.drop(columns=["Arrived At"]), st.text_input("Search by name or phone", key="prereg_search"))
         st.dataframe(view, width="stretch", hide_index=True)
         download_pair(view, f"{safe_filename(ev['event_name'])}_preregistrations", "Pre-registrations", f"prereg_{ev['id']}")
@@ -3658,6 +3995,7 @@ def prereg_tab():
     c[0].metric("Pre-registered", len(df))
     c[1].metric("Arrived", arrived)
     c[2].metric("Not yet arrived", len(df) - arrived)
+    invited_summary(df, "Registered")
     c1, c2 = st.columns([2, 1])
     search = c1.text_input("Search by name or phone", key="prereg_search")
     show = c2.radio("Show", ["Everyone", "Arrived", "Not yet arrived"], horizontal=True, key="prereg_show")
@@ -3704,6 +4042,8 @@ def attendance_tab(limited: bool = False):
         c[1].metric("Pre-registered", int((df["Pre-Registered"] == "Yes").sum()))
         c[2].metric("First-timers", int((df["First Visit"] == "Yes").sum()))
         c[3].metric("Under 18", int((df["Under 18"] == "Yes").sum()))
+        if not limited:
+            invited_summary(df, "Checked in")
         view = filter_people(df, st.text_input("Search by name or phone", key="ledger_search"))
         if limited:
             view = view[["#", "Check-In Time", "Full Name", "Pre-Registered", "First Visit", "Under 18"]]
@@ -3741,6 +4081,8 @@ def member_detail(member_id: int):
         home = m.get("country") if m.get("country") in COUNTRY_NAMES else "Other country"
         with st.form(f"edit_member_{member_id}"):
             full_name = st.text_input("Full name", value=m["full_name"])
+            gender = st.radio("Gender", GENDERS, index=GENDERS.index(m["gender"]) if m.get("gender") in GENDERS else None,
+                              horizontal=True)
             c1, c2 = st.columns(2)
             phone = c1.text_input("Phone (international format)", value=m["phone_number"])
             whatsapp = c2.text_input("WhatsApp", value=m["whatsapp_number"] or "")
@@ -3765,7 +4107,7 @@ def member_detail(member_id: int):
                 "emergency_contact_name": ec_name.strip() or None,
                 "emergency_contact_phone": to_intl(ec_phone, num_country) if ec_phone.strip() else None,
                 "parent_guardian_phone": to_intl(parent, num_country) if parent.strip() else None,
-                "is_minor": int(is_minor),
+                "is_minor": int(is_minor), "gender": gender,
                 "birth_day": b_day if (b_day and b_month) else None,
                 "birth_month": b_month if (b_day and b_month) else None,
             }
