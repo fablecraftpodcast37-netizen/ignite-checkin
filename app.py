@@ -33,7 +33,7 @@ Where the data lives
 
 Settings (Render: Environment variables. Streamlit Cloud: Secrets)
     ADMIN_USERNAME = "admin"
-    ADMIN_PASSWORD = <at least 12 characters, kept only in Render>
+    ADMIN_PASSWORD = <at least 8 characters, kept only in Render>
     APP_BASE_URL   = "https://your-app.onrender.com"
   No password is written in this file. Until ADMIN_PASSWORD is set, the main
   admin account is switched off (team accounts still work).
@@ -69,7 +69,7 @@ APP_NAME = "Ignite Prayer Network"
 DB_FILENAME = "ignite_network.db"
 PERSISTENT_DIR = "/data"            # Render persistent disk mount path
 DEFAULT_ADMIN_USERNAME = "admin"
-MIN_MASTER_PASSWORD = 12            # the main admin password (Render: ADMIN_PASSWORD) must be at least this long
+MIN_MASTER_PASSWORD = 8             # the main admin password (Render: ADMIN_PASSWORD) must be at least this long
 # SHA-256 of passwords that were once published in this code. They are refused even if set on Render.
 RETIRED_PASSWORD_HASHES = {"5eba08895fbded795fe039adcd6b4b8b3311a9cad494ed36175ed53013df6441"}
 TEAM_ROLES = {
@@ -1480,13 +1480,23 @@ def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
+def master_password_problem():
+    """Why the main admin password can't be used, in plain words, or None if it's fine."""
+    pw = get_setting("ADMIN_PASSWORD", "").strip()
+    if not pw:
+        return "ADMIN_PASSWORD isn't set on Render yet."
+    if _sha256(pw) in RETIRED_PASSWORD_HASHES:
+        return "ADMIN_PASSWORD on Render is still the old password that was published in the code, so it's blocked."
+    if len(pw) < MIN_MASTER_PASSWORD:
+        return f"ADMIN_PASSWORD on Render is shorter than {MIN_MASTER_PASSWORD} characters."
+    return None
+
+
 def master_password():
     """The main admin password from Render (or Streamlit secrets). None when it isn't
-    set, is too short, or is one that was once published in the code."""
-    pw = get_setting("ADMIN_PASSWORD", "")
-    if len(pw) < MIN_MASTER_PASSWORD or _sha256(pw) in RETIRED_PASSWORD_HASHES:
-        return None
-    return pw
+    set, is too short, or is one that was once published in the code. Spaces
+    accidentally pasted around it on Render are ignored."""
+    return None if master_password_problem() else get_setting("ADMIN_PASSWORD", "").strip()
 
 
 def authenticate(username: str, password: str):
@@ -2899,7 +2909,8 @@ MOTION_CSS = f"""<style>
 
 def page_top():
     """Flyer slot at the very top, then the brand. Returns the flyer slot."""
-    st.markdown(INFO_CSS + MOTION_CSS, unsafe_allow_html=True)
+    st.markdown(INFO_CSS, unsafe_allow_html=True)    # two separate blocks: joined on one line, the
+    st.markdown(MOTION_CSS, unsafe_allow_html=True)  # second <style> would show up as text
     banner = st.container(key="flyer_banner")
     brand_row()
     return banner
@@ -3618,10 +3629,14 @@ def admin_login():
         username = st.text_input("Username", autocomplete="username", max_chars=60)
         pw = st.text_input("Password", type="password", autocomplete="current-password", max_chars=200)
         go = st.form_submit_button("Sign in", type="primary", width="stretch")
-    if master_password() is None:
-        st.caption("The main admin account is switched off until its password (at least "
-                   f"{MIN_MASTER_PASSWORD} characters) is set as ADMIN_PASSWORD on Render. Team accounts still work.")
     user_key = f"{(username or '').strip().casefold()[:60]}|{client_ip()}"
+    owner_off = master_password_problem()
+    if go and owner_off and (username or "").strip().casefold() == owner_username().casefold():
+        # don't count these as failed guesses: the password simply isn't set up
+        st.error(f"The main admin account can't sign in yet. {owner_off} In Render, open your service, then "
+                 f"Environment, and set ADMIN_PASSWORD to a new password of at least {MIN_MASTER_PASSWORD} characters. "
+                 "Save it, wait for Render to restart, then sign in with that new password.")
+        go = False
     if go and rate_blocked("login_user", user_key):
         st.error("Too many wrong passwords for this username. Please wait 15 minutes and try again.")
         go = False
