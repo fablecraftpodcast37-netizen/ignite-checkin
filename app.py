@@ -60,6 +60,10 @@ from urllib.parse import quote, urlsplit
 import pandas as pd
 import qrcode
 import streamlit as st
+try:
+    import ignite_ics          # calendar files; the app still runs if this file wasn't uploaded
+except ImportError:
+    ignite_ics = None
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps, UnidentifiedImageError
 
 # ---------------------------------------------------------------------------
@@ -187,7 +191,9 @@ CREATE TABLE IF NOT EXISTS events (
     map_url     TEXT,                         -- Google Maps link; built from the venue when empty
     rsvp_contacts TEXT,                       -- one 'Name, phone' per line
     inviters    TEXT,                         -- old pick-list of inviter names (no longer used for new events)
-    ask_invited INTEGER NOT NULL DEFAULT 0    -- 1 = members are asked to type who invited them
+    ask_invited INTEGER NOT NULL DEFAULT 0,   -- 1 = members are asked to type who invited them
+    dress_code  TEXT,                         -- e.g. "All white" (empty = no dress code)
+    dress_colors TEXT                         -- chosen colours, comma separated, e.g. "White, Gold"
 );
 
 CREATE TABLE IF NOT EXISTS members (
@@ -373,6 +379,8 @@ MIGRATIONS = [
     ("pre_registrations", "invited_by", "TEXT"),
     ("members", "gender", "TEXT"),
     ("events", "ask_invited", "INTEGER NOT NULL DEFAULT 0"),
+    ("events", "dress_code", "TEXT"),
+    ("events", "dress_colors", "TEXT"),
 ]
 DATA_VERSION = "intl-phones-1"   # bump when a one-off data upgrade is added
 
@@ -564,7 +572,7 @@ def set_app_setting(key: str, value: str):
 # ----- events ---------------------------------------------------------------
 EVENT_COLUMNS = """e.id, e.event_name, e.event_type, e.event_date, e.venue, e.is_open,
                    e.prereg_open, e.prereg_deadline, e.uses_checkin, e.created_at, e.flyer_bytes IS NOT NULL AS has_flyer,
-                   e.start_time, e.end_time, e.theme, e.about, e.map_url, e.rsvp_contacts, e.inviters, e.ask_invited,
+                   e.start_time, e.end_time, e.theme, e.about, e.map_url, e.rsvp_contacts, e.inviters, e.ask_invited, e.dress_code, e.dress_colors,
                    (SELECT COUNT(*) FROM attendance a WHERE a.event_id = e.id) AS attendees,
                    (SELECT COUNT(*) FROM pre_registrations p WHERE p.event_id = e.id) AS preregs"""
 
@@ -614,7 +622,8 @@ def update_event(event_id, name, event_type, event_date, venue, is_open, prereg_
         )
 
 
-PAGE_FIELDS = ("start_time", "end_time", "theme", "about", "map_url", "rsvp_contacts", "inviters", "ask_invited")
+PAGE_FIELDS = ("start_time", "end_time", "theme", "about", "map_url", "rsvp_contacts", "inviters", "ask_invited",
+               "dress_code", "dress_colors")
 
 
 def set_event_page(event_id: int, **fields):
@@ -2025,9 +2034,34 @@ ICON_INFO = ('<svg viewBox="0 0 52 52" aria-hidden="true"><path d="M26 23v13M26 
              'stroke="currentColor" stroke-width="4.5" stroke-linecap="round"/></svg>')
 
 
+HEADING_FONTS = {
+    "Playfair Display": "Bold classic: strong and easy to read on phones (recommended)",
+    "Cormorant Garamond": "Elegant: light and graceful (the original look)",
+    "Fraunces": "Modern: warm, heavy and eye-catching",
+}
+DEFAULT_HEADING_FONT = "Playfair Display"
+
+
+def heading_font() -> str:
+    f = get_app_setting("heading_font", DEFAULT_HEADING_FONT)
+    return f if f in HEADING_FONTS else DEFAULT_HEADING_FONT
+
+
+def _with_heading_font(css: str) -> str:
+    """The stylesheet is written for Cormorant Garamond; swap in the chosen heading font."""
+    font = heading_font()
+    if font == "Cormorant Garamond":
+        return css
+    weights = "ital,wght@0,500;0,600;0,700;0,800;1,600;1,700"     # upright and italic
+    return (css.replace("family=Cormorant+Garamond:wght@500;600;700", f"family={font.replace(' ', '+')}:{weights}")
+               .replace("'Cormorant Garamond'", f"'{font}'"))
+
+
 def inject_css(public: bool):
     width = "560px" if public else "1240px"
-    st.markdown(
+    _md = st.markdown
+    st_markdown = lambda body, **kw: _md(_with_heading_font(body), **kw)
+    st_markdown(
         f"""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@500;600;700&family=Manrope:wght@400;500;600;700&display=swap');
@@ -2045,6 +2079,7 @@ def inject_css(public: bool):
     font-family: 'Manrope', system-ui, -apple-system, 'Segoe UI', sans-serif !important; }}
 .stApp .stMarkdown .ig-word, .stApp .stMarkdown .ig-h1, .stApp .stMarkdown .ig-ticket-date .d,
 .stApp .stMarkdown .ig-ticket-name, .stApp .stMarkdown .ig-formtitle, .stApp .stMarkdown .ig-serif,
+.stApp .stMarkdown .ig-info-theme,
 .stApp .stMarkdown .ig-serif *, .stApp .stMarkdown h1 *, .stApp .stMarkdown h2 *, .stApp .stMarkdown h3 *,
 .stApp .stMarkdown h4 * {{ font-family: 'Cormorant Garamond', Georgia, serif !important; }}
 .stApp [data-testid="stIconMaterial"], .stApp .stMarkdown [data-testid="stIconMaterial"],
@@ -2333,6 +2368,69 @@ def map_link(ev: dict) -> str:
     return ""
 
 
+# Colours offered for a dress code (name -> swatch). Add more freely.
+DRESS_COLOURS = {
+    "White": "#FFFFFF", "Cream": "#F3E9D2", "Beige": "#D8C3A5", "Gold": "#C9A24B", "Silver": "#C0C0C8",
+    "Black": "#151515", "Grey": "#8A8A8A", "Navy": "#1C2B4A", "Royal blue": "#2348A6", "Sky blue": "#6EB5E6",
+    "Purple": "#4B2E83", "Lilac": "#B9A3D8", "Wine": "#722F37", "Red": "#C62828", "Pink": "#E58FB0",
+    "Orange": "#E0662A", "Yellow": "#F2C230", "Green": "#2E7D32", "Brown": "#6D4C33",
+}
+
+
+def dress_colour_list(text) -> list[str]:
+    return [c.strip() for c in str(text or "").split(",") if c.strip()]
+
+
+def dress_swatches(text) -> str:
+    chips = []
+    for name in dress_colour_list(text):
+        hexv = DRESS_COLOURS.get(name, name if re.fullmatch(r"#[0-9A-Fa-f]{6}", name) else "#CCCCCC")
+        label = name if name in DRESS_COLOURS else "Colour"
+        chips.append(f'<span class="ig-swatch"><i style="background:{hexv}"></i>{esc(label)}</span>')
+    return f'<div class="ig-swatches">{"".join(chips)}</div>' if chips else ""
+
+
+def auto_about(ev: dict) -> str:
+    """A short About written from what the team already filled in (name, theme, date,
+    venue, time). Shown only when nobody has written one."""
+    name = (ev.get("event_name") or "This programme").strip()
+    try:
+        hour = int(str(ev.get("start_time") or "")[:2])
+    except ValueError:
+        hour = None
+    part = ("a morning" if hour is not None and hour < 12 else "an afternoon" if hour is not None and hour < 17
+            else "an evening" if hour is not None else "a time")
+    if ev.get("event_type") == "Impromptu":
+        opening = f"{name} is a special gathering of the {APP_NAME} family"
+    else:
+        opening = f"{name} is {part} of worship, the Word and prayer with the {APP_NAME} family"
+    when = ""
+    try:
+        if ev.get("event_date"):
+            d = date.fromisoformat(ev["event_date"])
+            when = f" on {d.strftime('%A')}, {d.day} {d.strftime('%B')}"
+    except ValueError:
+        pass
+    where = f" at {ev['venue'].strip()}" if ev.get("venue") else ""
+    text = f"{opening}{when}{where}."
+    if ev.get("theme"):
+        text += f" We gather under the theme “{ev['theme'].strip()}”, so come with an open heart and your Bible."
+    text += " Come early, bring someone with you, and come expecting to meet God."
+    return text
+
+
+def about_text(ev: dict) -> str:
+    return (ev.get("about") or "").strip() or auto_about(ev)
+
+
+def ics_link(ev: dict):
+    """The calendar-file link, served by server.py. None when the app was started with
+    `streamlit run app.py` (then a download button is shown instead)."""
+    if not ev.get("event_date") or os.environ.get("IGNITE_ASGI") != "1":
+        return None
+    return f"/calendar/{ev['id']}.ics"
+
+
 def calendar_link(ev: dict) -> str:
     """Google Calendar 'add event' link. Ghana time is UTC, so times go in as Z."""
     if not ev.get("event_date"):
@@ -2381,6 +2479,13 @@ ICON_SPARK = ('<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentCo
 ICON_CALL = ('<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M6.6 10.8a15.1 15.1 0 0 0 6.6 6.6'
              'l2.2-2.2a1 1 0 0 1 1-.25 11.4 11.4 0 0 0 3.6.57 1 1 0 0 1 1 1V20a1 1 0 0 1-1 1A17 17 0 0 1 3 4a1 1 0 0 1 1-1'
              'h3.5a1 1 0 0 1 1 1c0 1.25.2 2.45.57 3.57a1 1 0 0 1-.25 1z"/></svg>')
+ICON_HANGER = ('<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" '
+               'stroke-linecap="round" stroke-linejoin="round" d="M12 7a2 2 0 1 1 2-2M12 7v1.5L3 15a1.5 1.5 0 0 0 1 2.7h16'
+               'a1.5 1.5 0 0 0 1-2.7l-9-6.5"/></svg>')
+ICON_PHONE_CAL = ('<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M7 2h10a2 2 0 0 1 2 2v16a2 2 0 0 1-2 2'
+                  'H7a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2zm0 3v13h10V5H7zm4 14.5a1 1 0 1 0 2 0 1 1 0 0 0-2 0z"/></svg>')
+ICON_G = ('<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 11v2.8h3.9c-.2 1-1.4 3-3.9 3a4.3 4.3 0 0 1 0-8.6'
+          'c1.3 0 2.2.6 2.7 1l1.9-1.8A6.9 6.9 0 0 0 12 5.6a6.4 6.4 0 1 0 0 12.8c3.7 0 6.1-2.6 6.1-6.2 0-.4 0-.8-.1-1.2H12z"/></svg>')
 ICON_MAP = ('<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2a7 7 0 0 1 7 7c0 5.25-7 13-7 13'
             'S5 14.25 5 9a7 7 0 0 1 7-7zm0 4.5A2.5 2.5 0 1 0 12 11.5 2.5 2.5 0 0 0 12 6.5z"/></svg>')
 
@@ -2397,9 +2502,17 @@ def event_info_card(ev: dict):
             pass
     if time_range(ev):
         when.append(time_range(ev) + " GMT")
-    cal = calendar_link(ev)
+    cal, ics = calendar_link(ev), ics_link(ev)
     if when:
-        add = f'<a class="ig-info-link" href="{esc(cal)}" target="_blank" rel="noopener">Add to my calendar</a>' if cal else ""
+        add = ""
+        if cal or ics:
+            btns = []
+            if ics:
+                btns.append(f'<a class="ig-calbtn" href="{esc(ics)}">{ICON_PHONE_CAL}iPhone · Samsung · Outlook</a>')
+            if cal:
+                btns.append(f'<a class="ig-calbtn" href="{esc(cal)}" target="_blank" rel="noopener">{ICON_G}Google Calendar</a>')
+            add = ('<div class="ig-calwrap"><div class="ig-calhint">Add to your calendar. Your phone will remind you '
+                   'a day before and 2 hours before.</div>' + "".join(btns) + "</div>")
         rows.append(("Date & time", ICON_CAL, "<br>".join(esc(w) for w in when) + add))
     if ev.get("venue"):
         maps = map_link(ev)
@@ -2408,8 +2521,11 @@ def event_info_card(ev: dict):
         rows.append(("Venue", ICON_MAP, esc(ev["venue"]) + link))
     if ev.get("theme"):
         rows.append(("Theme", ICON_SPARK, f'<span class="ig-info-theme">{esc(ev["theme"])}</span>'))
-    if ev.get("about"):
-        rows.append(("About", ICON_BOOK, esc(ev["about"]).replace("\n", "<br>")))
+    if ev.get("dress_code") or ev.get("dress_colors"):
+        rows.append(("Dress code", ICON_HANGER,
+                     (f'<span class="ig-info-dress">{esc(ev.get("dress_code"))}</span>' if ev.get("dress_code") else "")
+                     + dress_swatches(ev.get("dress_colors"))))
+    rows.append(("About", ICON_BOOK, esc(about_text(ev)).replace("\n", "<br>")))
     contacts = parse_contacts(ev.get("rsvp_contacts"))
     if contacts:
         people = []
@@ -2431,6 +2547,13 @@ def event_info_card(ev: dict):
                    f'<div class="ig-info-k">{esc(k)}</div><div class="ig-info-v">{v}</div></div></div>'
                    for k, ico, v in rows)
     st.markdown(f'<div class="ig-info">{body}</div>', unsafe_allow_html=True)
+    if when and ignite_ics and not ics_link(ev) and ev.get("event_date"):
+        try:
+            st.download_button("Add to iPhone / Samsung / Outlook calendar", ignite_ics.build_ics(ev),
+                               file_name=ignite_ics.ics_filename(ev), mime="text/calendar",
+                               icon=":material/event:", width="stretch", key=f"ics_{ev['id']}")
+        except ValueError:
+            pass
 
 
 SAFE_LINE = ('<div class="ig-safe"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2a5 5 0 0 1 '
@@ -2851,7 +2974,7 @@ INFO_CSS = f"""<style>
 .ig-info-txt {{ min-width:0; flex:1; }}
 .ig-info-k {{ font-size:.66rem; font-weight:700; letter-spacing:.16em; text-transform:uppercase; color:var(--gold-text); }}
 .ig-info-v {{ color:var(--ink); font-size:.95rem; line-height:1.5; margin-top:.15rem; overflow-wrap:anywhere; }}
-.ig-info-theme {{ font-family:'Cormorant Garamond', Georgia, serif; font-size:1.2rem; font-weight:700; font-style:italic; }}
+.ig-info-theme {{ font-family:'Cormorant Garamond', Georgia, serif !important; font-size:1.2rem; font-weight:700; font-style:italic; }}
 a.ig-info-link {{ display:inline-block; margin-top:.35rem; font-size:.85rem; font-weight:700; color:var(--royal) !important;
                  text-decoration:none; border-bottom:1.5px solid rgba(75,46,131,.3); }}
 .ig-info-v a.ig-info-link {{ display:table; }}
@@ -2865,6 +2988,17 @@ a.ig-info-link {{ display:inline-block; margin-top:.35rem; font-size:.85rem; fon
                   text-decoration:none; font-size:.8rem; font-weight:700; padding:0 .55rem; }}
 .ig-rsvp-acts a svg {{ width:1rem; height:1rem; }}
 .ig-rsvp-acts a.wa {{ background:#1E7B47; border-color:#1E7B47; color:#fff !important; }}
+.ig-info-dress {{ font-weight:700; }}
+.ig-swatches {{ display:flex; flex-wrap:wrap; gap:.4rem; margin-top:.45rem; }}
+.ig-swatch {{ display:inline-flex; align-items:center; gap:.35rem; background:var(--sand); border-radius:999px;
+             padding:.25rem .65rem .25rem .3rem; font-size:.82rem; font-weight:600; color:var(--ink); }}
+.ig-swatch i {{ width:1.1rem; height:1.1rem; border-radius:50%; box-shadow:inset 0 0 0 1px rgba(31,26,51,.18); display:inline-block; }}
+.ig-calwrap {{ margin-top:.55rem; }}
+.ig-calhint {{ font-size:.8rem; color:var(--muted); margin-bottom:.35rem; }}
+a.ig-calbtn {{ display:inline-flex; align-items:center; gap:.4rem; margin:.2rem .35rem .2rem 0; padding:.45rem .8rem;
+              border-radius:10px; background:#fff; border:1px solid var(--line); color:var(--royal) !important;
+              font-size:.84rem; font-weight:700; text-decoration:none; }}
+a.ig-calbtn svg {{ width:1rem; height:1rem; }}
 .ig-safe {{ display:flex; align-items:center; justify-content:center; gap:.35rem; color:var(--muted); font-size:.8rem;
            margin-top:.55rem; }}
 .ig-safe svg {{ width:.85rem; height:.85rem; color:var(--gold-text); }}
@@ -2909,7 +3043,7 @@ MOTION_CSS = f"""<style>
 
 def page_top():
     """Flyer slot at the very top, then the brand. Returns the flyer slot."""
-    st.markdown(INFO_CSS, unsafe_allow_html=True)    # two separate blocks: joined on one line, the
+    st.markdown(_with_heading_font(INFO_CSS), unsafe_allow_html=True)    # two separate blocks: joined on one line, the
     st.markdown(MOTION_CSS, unsafe_allow_html=True)  # second <style> would show up as text
     banner = st.container(key="flyer_banner")
     brand_row()
@@ -3884,6 +4018,8 @@ def create_event_section(has_events: bool):
             is_open = c6.toggle("Open day-of check-in", value=True,
                                 help="Ignored for pre-registration-only events.")
             deadline = deadline_inputs("new_event")
+            st.markdown("**Dress code (optional)**")
+            has_dress, dress_text, dress_cols = dress_inputs("new_event")
             create = st.form_submit_button("Create event", type="primary")
         if create:
             name = ev_name.strip() or f"{ev_type} {datetime.now():%Y-%m-%d}"
@@ -3900,6 +4036,8 @@ def create_event_section(has_events: bool):
             new_id = create_event(name, ev_type, ev_date.isoformat() if ev_date else None,
                                   venue, flyer, is_open, prereg_open, deadline if prereg_open else None,
                                   uses_checkin)
+            if has_dress and (dress_text or dress_cols):
+                set_event_page(new_id, dress_code=dress_text, dress_colors=", ".join(dress_cols))
             st.session_state.manage_event = new_id
             notify(f"Created “{name}”. " + {
                 MODE_BOTH: "Its registration link and check-in QR code are ready below.",
@@ -4032,9 +4170,31 @@ def details_section(ev: dict):
             st.rerun()
 
 
+def dress_inputs(key: str, ev=None):
+    """Dress code fields for a form: on/off, a few words, and colours."""
+    ev = ev or {}
+    has = st.checkbox("This event has a dress code", value=bool(ev.get("dress_code") or ev.get("dress_colors")),
+                      key=f"{key}_dress_on")
+    c1, c2 = st.columns([1, 1.3])
+    text = c1.text_input("Dress code", value=ev.get("dress_code") or "", key=f"{key}_dress_txt", max_chars=80,
+                         placeholder="e.g. All white, Smart casual, Traditional")
+    picked = [c for c in dress_colour_list(ev.get("dress_colors")) if c in DRESS_COLOURS]
+    cols = c2.multiselect("Colours", list(DRESS_COLOURS), default=picked, key=f"{key}_dress_cols",
+                          placeholder="Choose one or more colours")
+    st.caption("Untick the box to have no dress code. Members see the words and a little swatch for each colour.")
+    return has, text.strip(), cols
+
+
 def page_details_section(ev: dict):
     st.caption("This is the information card members see under the flyer on the registration and check-in pages. "
                "Fill in only what you need. Anything left empty simply doesn't show.")
+    about_key = f"about_{ev['id']}"
+    if st.session_state.get("_about_for") != (ev["id"], ev.get("about")):
+        st.session_state[about_key] = ev.get("about") or ""      # load the saved About into the box
+        st.session_state["_about_for"] = (ev["id"], ev.get("about"))
+    if st.button("✨ Write the About for me (you can edit it)", key=f"about_fill_{ev['id']}", type="tertiary"):
+        st.session_state[about_key] = auto_about(ev)
+        st.rerun()
     with st.form(f"page_details_{ev['id']}"):
         c1, c2 = st.columns(2)
         slots = [f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 15, 30, 45)]
@@ -4044,13 +4204,17 @@ def page_details_section(ev: dict):
         end = c2.selectbox("Ends at (GMT, optional)", slots, index=pick(ev.get("end_time")), format_func=fmt_time_short,
                            placeholder="Choose a time")
         theme = st.text_input("Theme", value=ev.get("theme") or "", placeholder="e.g. Fire on the Altar (Leviticus 6:13)")
-        about = st.text_area("A few words about the programme", value=ev.get("about") or "", height=110,
-                             placeholder="What is happening, who should come, what to bring...")
+        about = st.text_area("About the programme (leave empty and we'll write one for you)", key=f"about_{ev['id']}",
+                             height=120, placeholder=auto_about(ev))
+        st.caption("Empty: members see an About written from the name, date, venue and theme. "
+                   "That suggestion shows greyed in the box and updates by itself when you change those details. Type your own any time to replace it.")
         map_url = st.text_input("Google Maps link (optional)", value=ev.get("map_url") or "",
                                 help="Paste the share link from Google Maps. If you leave it empty, members get a "
                                      "map search for the venue name instead.")
         rsvp = st.text_area("Contacts for questions (one per line)", value=ev.get("rsvp_contacts") or "", height=90,
                             placeholder="Brother Kofi, 024 123 4567\nSister Ama, 055 765 4321")
+        st.markdown("**Dress code**")
+        has_dress, dress_text, dress_cols = dress_inputs(f"page_{ev['id']}", ev)
         ask = st.checkbox("Ask members “Who invited you?”", value=asks_invited(ev),
                           help="Members type the name themselves. It's optional for them.")
         st.caption("Their answer shows in the pre-registration and check-in lists, with a count per name. "
@@ -4064,11 +4228,12 @@ def page_details_section(ev: dict):
             st.error("The map link should start with https://")
             return
         set_event_page(ev["id"], start_time=start or "", end_time=end or "", theme=theme, about=about,
-                       map_url=map_url, rsvp_contacts=rsvp, inviters="", ask_invited=1 if ask else 0)
+                       map_url=map_url, rsvp_contacts=rsvp, inviters="", ask_invited=1 if ask else 0,
+                       dress_code=dress_text if has_dress else "", dress_colors=", ".join(dress_cols) if has_dress else "")
         notify(f"Saved what members see for “{ev['event_name']}”.")
         st.rerun()
     st.markdown("**Preview**")
-    st.markdown(INFO_CSS, unsafe_allow_html=True)
+    st.markdown(_with_heading_font(INFO_CSS), unsafe_allow_html=True)
     event_ticket(ev)
     event_info_card(ev)
 
@@ -4098,6 +4263,13 @@ def flyer_section(ev: dict):
     else:
         st.caption("This event has no flyer yet.")
     look_now = get_app_setting("flyer_look", "frosted")
+    font_now = heading_font()
+    font = st.radio("Heading font on every page", list(HEADING_FONTS), format_func=lambda f: f"{f}: {HEADING_FONTS[f]}",
+                    index=list(HEADING_FONTS).index(font_now), key=f"heading_font_{ev['id']}")
+    if font != font_now:
+        set_app_setting("heading_font", font)
+        notify(f"Heading font set to {font}.")
+        st.rerun()
     look = st.radio("How the flyer shows on the member pages", list(FLYER_LOOKS), format_func=FLYER_LOOKS.get,
                     index=list(FLYER_LOOKS).index(look_now) if look_now in FLYER_LOOKS else 0,
                     key=f"flyer_look_{ev['id']}",
