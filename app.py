@@ -2424,11 +2424,38 @@ def about_text(ev: dict) -> str:
 
 
 def ics_link(ev: dict):
-    """The calendar-file link, served by server.py. None when the app was started with
-    `streamlit run app.py` (then a download button is shown instead)."""
-    if not ev.get("event_date") or os.environ.get("IGNITE_ASGI") != "1":
+    """A web address for the event's calendar file (.ics), opened straight into the phone's
+    calendar app. Through server.py it's a fixed link (/calendar/<id>.ics); otherwise the
+    file is hosted for this visit through Streamlit's own file server."""
+    if not ev.get("event_date") or ignite_ics is None:
         return None
-    return f"/calendar/{ev['id']}.ics"
+    if os.environ.get("IGNITE_ASGI") == "1":
+        return f"/calendar/{ev['id']}.ics"
+    try:
+        from streamlit import runtime
+        if not runtime.exists():
+            return None
+        data = ignite_ics.build_ics(ev)
+        return runtime.get_instance().media_file_mgr.add(data, "text/calendar", f"ignite-ics-{ev['id']}")
+    except Exception:
+        return None
+
+
+def device_kind() -> str:
+    """Which calendar the visitor's phone uses, from the browser's User-Agent."""
+    try:
+        ua = (st.context.headers.get("User-Agent") or "").lower()
+    except Exception:
+        ua = ""
+    if not isinstance(ua, str):
+        return "other"
+    if any(k in ua for k in ("iphone", "ipad", "ipod", "macintosh")):
+        return "apple"          # iPhone, iPad and Mac: Apple Calendar opens .ics files directly
+    if "android" in ua:
+        return "android"        # Android (Samsung, Tecno, Pixel...): the Google Calendar on the phone
+    if "windows" in ua:
+        return "windows"        # Outlook / Windows Calendar open .ics files
+    return "other"
 
 
 def calendar_link(ev: dict) -> str:
@@ -2482,12 +2509,39 @@ ICON_CALL = ('<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentCol
 ICON_HANGER = ('<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" '
                'stroke-linecap="round" stroke-linejoin="round" d="M12 7a2 2 0 1 1 2-2M12 7v1.5L3 15a1.5 1.5 0 0 0 1 2.7h16'
                'a1.5 1.5 0 0 0 1-2.7l-9-6.5"/></svg>')
+ICON_CAL_ADD = ('<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M7 2h2v2h6V2h2v2h2a2 2 0 0 1 2 2v13'
+                'a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2V2zm12 8H5v9h14v-9zm-8 1.5h2v2h2v2h-2v2h-2v-2H9v-2h2v-2z"/></svg>')
 ICON_PHONE_CAL = ('<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M7 2h10a2 2 0 0 1 2 2v16a2 2 0 0 1-2 2'
                   'H7a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2zm0 3v13h10V5H7zm4 14.5a1 1 0 1 0 2 0 1 1 0 0 0-2 0z"/></svg>')
 ICON_G = ('<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 11v2.8h3.9c-.2 1-1.4 3-3.9 3a4.3 4.3 0 0 1 0-8.6'
           'c1.3 0 2.2.6 2.7 1l1.9-1.8A6.9 6.9 0 0 0 12 5.6a6.4 6.4 0 1 0 0 12.8c3.7 0 6.1-2.6 6.1-6.2 0-.4 0-.8-.1-1.2H12z"/></svg>')
 ICON_MAP = ('<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2a7 7 0 0 1 7 7c0 5.25-7 13-7 13'
             'S5 14.25 5 9a7 7 0 0 1 7-7zm0 4.5A2.5 2.5 0 1 0 12 11.5 2.5 2.5 0 0 0 12 6.5z"/></svg>')
+
+
+def calendar_button(ev: dict) -> str:
+    """One "Add to my calendar" button. The phone decides where it goes: iPhones get the
+    calendar file (Apple Calendar opens it with the reminders), Android phones get Google
+    Calendar, which is the calendar on the phone. A small link offers the other way."""
+    google, ics = calendar_link(ev), ics_link(ev)
+    if not (google or ics):
+        return ""
+    kind = device_kind()
+    if kind in ("apple", "windows") and ics:
+        main, other, other_label = ics, google, "Use Google Calendar instead"
+        hint = "Opens your phone's calendar. It will remind you a day before and 2 hours before."
+        target = ""
+    elif google:
+        main, other, other_label = google, ics, "Use another calendar app"
+        hint = "Opens Google Calendar, the calendar on your phone. Tap Save and it will remind you before it starts."
+        target = ' target="_blank" rel="noopener"'
+    else:
+        main, other, other_label, hint, target = ics, None, "", "Opens your calendar with reminders.", ""
+    other_target = "" if other == ics else ' target="_blank" rel="noopener"'
+    other_html = (f'<a class="ig-calother" href="{esc(other)}"{other_target}>{esc(other_label)}</a>'
+                  if other else "")
+    return (f'<div class="ig-calwrap"><a class="ig-calbtn ig-calmain" href="{esc(main)}"{target}>{ICON_CAL_ADD}'
+            f'Add to my calendar</a><div class="ig-calhint">{esc(hint)}</div>{other_html}</div>')
 
 
 def event_info_card(ev: dict):
@@ -2502,18 +2556,8 @@ def event_info_card(ev: dict):
             pass
     if time_range(ev):
         when.append(time_range(ev) + " GMT")
-    cal, ics = calendar_link(ev), ics_link(ev)
     if when:
-        add = ""
-        if cal or ics:
-            btns = []
-            if ics:
-                btns.append(f'<a class="ig-calbtn" href="{esc(ics)}">{ICON_PHONE_CAL}iPhone · Samsung · Outlook</a>')
-            if cal:
-                btns.append(f'<a class="ig-calbtn" href="{esc(cal)}" target="_blank" rel="noopener">{ICON_G}Google Calendar</a>')
-            add = ('<div class="ig-calwrap"><div class="ig-calhint">Add to your calendar. Your phone will remind you '
-                   'a day before and 2 hours before.</div>' + "".join(btns) + "</div>")
-        rows.append(("Date & time", ICON_CAL, "<br>".join(esc(w) for w in when) + add))
+        rows.append(("Date & time", ICON_CAL, "<br>".join(esc(w) for w in when) + calendar_button(ev)))
     if ev.get("venue"):
         maps = map_link(ev)
         link = (f'<a class="ig-info-link" href="{esc(maps)}" target="_blank" rel="noopener">Open in Google Maps</a>'
@@ -2547,13 +2591,6 @@ def event_info_card(ev: dict):
                    f'<div class="ig-info-k">{esc(k)}</div><div class="ig-info-v">{v}</div></div></div>'
                    for k, ico, v in rows)
     st.markdown(f'<div class="ig-info">{body}</div>', unsafe_allow_html=True)
-    if when and ignite_ics and not ics_link(ev) and ev.get("event_date"):
-        try:
-            st.download_button("Add to iPhone / Samsung / Outlook calendar", ignite_ics.build_ics(ev),
-                               file_name=ignite_ics.ics_filename(ev), mime="text/calendar",
-                               icon=":material/event:", width="stretch", key=f"ics_{ev['id']}")
-        except ValueError:
-            pass
 
 
 SAFE_LINE = ('<div class="ig-safe"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2a5 5 0 0 1 '
@@ -2993,8 +3030,15 @@ a.ig-info-link {{ display:inline-block; margin-top:.35rem; font-size:.85rem; fon
 .ig-swatch {{ display:inline-flex; align-items:center; gap:.35rem; background:var(--sand); border-radius:999px;
              padding:.25rem .65rem .25rem .3rem; font-size:.82rem; font-weight:600; color:var(--ink); }}
 .ig-swatch i {{ width:1.1rem; height:1.1rem; border-radius:50%; box-shadow:inset 0 0 0 1px rgba(31,26,51,.18); display:inline-block; }}
-.ig-calwrap {{ margin-top:.55rem; }}
-.ig-calhint {{ font-size:.8rem; color:var(--muted); margin-bottom:.35rem; }}
+.ig-calwrap {{ margin-top:.6rem; }}
+a.ig-calmain {{ background:linear-gradient(135deg, #5B37A0, var(--royal) 55%, var(--royal-dark)) !important;
+               color:#fff !important; border:none !important; padding:.6rem 1rem !important; font-size:.9rem !important;
+               box-shadow:0 10px 20px -12px rgba(75,46,131,.9); }}
+.stApp .stMarkdown a.ig-calmain, .stApp .stMarkdown a.ig-calmain:visited, .stApp .stMarkdown a.ig-calmain * {{
+    color:#fff !important; -webkit-text-fill-color:#fff; }}
+a.ig-calmain svg {{ color:#fff; }}
+.ig-calhint {{ font-size:.78rem; color:var(--muted); margin:.35rem 0 .1rem; line-height:1.45; }}
+a.ig-calother {{ font-size:.78rem; font-weight:600; color:var(--royal) !important; text-decoration:underline; }}
 a.ig-calbtn {{ display:inline-flex; align-items:center; gap:.4rem; margin:.2rem .35rem .2rem 0; padding:.45rem .8rem;
               border-radius:10px; background:#fff; border:1px solid var(--line); color:var(--royal) !important;
               font-size:.84rem; font-weight:700; text-decoration:none; }}
