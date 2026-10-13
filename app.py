@@ -2064,7 +2064,7 @@ def inject_css(public: bool):
     st_markdown(
         f"""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@500;600;700&family=Manrope:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@500;600;700&family=Manrope:wght@400;500;600;700&family=Lora:wght@400;500&display=swap');
 
 :root {{ --ink:{INK}; --royal:{ROYAL}; --royal-dark:{ROYAL_DARK}; --gold:{GOLD}; --gold-text:{GOLD_TEXT};
         --flame:{FLAME}; --paper:{PAPER}; --sand:{SAND}; --line:{LINE}; --muted:{MUTED}; }}
@@ -2520,28 +2520,21 @@ ICON_MAP = ('<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColo
 
 
 def calendar_button(ev: dict) -> str:
-    """One "Add to my calendar" button. The phone decides where it goes: iPhones get the
-    calendar file (Apple Calendar opens it with the reminders), Android phones get Google
-    Calendar, which is the calendar on the phone. A small link offers the other way."""
+    """One "Add to my calendar" button. The site detects the phone and sends the member
+    straight to that phone's own calendar: iPhones (and Macs/Windows) get the calendar
+    file, which opens in their calendar app with reminders; Android phones get Google
+    Calendar, the calendar built into Android. No choices for the member to make."""
     google, ics = calendar_link(ev), ics_link(ev)
-    if not (google or ics):
-        return ""
-    kind = device_kind()
-    if kind in ("apple", "windows") and ics:
-        main, other, other_label = ics, google, "Use Google Calendar instead"
-        hint = "Opens your phone's calendar. It will remind you a day before and 2 hours before."
-        target = ""
+    if device_kind() in ("apple", "windows") and ics:
+        href, target = ics, ""
     elif google:
-        main, other, other_label = google, ics, "Use another calendar app"
-        hint = "Opens Google Calendar, the calendar on your phone. Tap Save and it will remind you before it starts."
-        target = ' target="_blank" rel="noopener"'
+        href, target = google, ' target="_blank" rel="noopener"'
+    elif ics:
+        href, target = ics, ""
     else:
-        main, other, other_label, hint, target = ics, None, "", "Opens your calendar with reminders.", ""
-    other_target = "" if other == ics else ' target="_blank" rel="noopener"'
-    other_html = (f'<a class="ig-calother" href="{esc(other)}"{other_target}>{esc(other_label)}</a>'
-                  if other else "")
-    return (f'<div class="ig-calwrap"><a class="ig-calbtn ig-calmain" href="{esc(main)}"{target}>{ICON_CAL_ADD}'
-            f'Add to my calendar</a><div class="ig-calhint">{esc(hint)}</div>{other_html}</div>')
+        return ""
+    return (f'<div class="ig-calwrap"><a class="ig-calbtn ig-calmain" href="{esc(href)}"{target}>{ICON_CAL_ADD}'
+            'Add to my calendar</a><div class="ig-calhint">Saves it on your phone so you get a reminder.</div></div>')
 
 
 def event_info_card(ev: dict):
@@ -2569,7 +2562,7 @@ def event_info_card(ev: dict):
         rows.append(("Dress code", ICON_HANGER,
                      (f'<span class="ig-info-dress">{esc(ev.get("dress_code"))}</span>' if ev.get("dress_code") else "")
                      + dress_swatches(ev.get("dress_colors"))))
-    rows.append(("About", ICON_BOOK, esc(about_text(ev)).replace("\n", "<br>")))
+    rows.append(("About", ICON_BOOK, f'<div class="ig-about">{esc(about_text(ev)).replace(chr(10), "<br>")}</div>'))
     contacts = parse_contacts(ev.get("rsvp_contacts"))
     if contacts:
         people = []
@@ -3026,6 +3019,12 @@ a.ig-info-link {{ display:inline-block; margin-top:.35rem; font-size:.85rem; fon
 .ig-rsvp-acts a svg {{ width:1rem; height:1rem; }}
 .ig-rsvp-acts a.wa {{ background:#1E7B47; border-color:#1E7B47; color:#fff !important; }}
 .ig-info-dress {{ font-weight:700; }}
+/* the About reads like a warm invitation: a book-style serif and a gold first letter */
+.stApp .stMarkdown .ig-about, .stApp .stMarkdown .ig-about * {{
+    font-family:'Lora', Georgia, 'Times New Roman', serif !important; }}
+.ig-about {{ font-size:1.03rem; line-height:1.75; color:#2B2540; margin-top:.25rem; letter-spacing:.005em; }}
+.ig-about::first-letter {{ font-family:'Cormorant Garamond', Georgia, serif; float:left; font-size:3rem; line-height:.82;
+    font-weight:700; color:var(--gold-text); padding:.3rem .45rem 0 0; }}
 .ig-swatches {{ display:flex; flex-wrap:wrap; gap:.4rem; margin-top:.45rem; }}
 .ig-swatch {{ display:inline-flex; align-items:center; gap:.35rem; background:var(--sand); border-radius:999px;
              padding:.25rem .65rem .25rem .3rem; font-size:.82rem; font-weight:600; color:var(--ink); }}
@@ -3038,7 +3037,6 @@ a.ig-calmain {{ background:linear-gradient(135deg, #5B37A0, var(--royal) 55%, va
     color:#fff !important; -webkit-text-fill-color:#fff; }}
 a.ig-calmain svg {{ color:#fff; }}
 .ig-calhint {{ font-size:.78rem; color:var(--muted); margin:.35rem 0 .1rem; line-height:1.45; }}
-a.ig-calother {{ font-size:.78rem; font-weight:600; color:var(--royal) !important; text-decoration:underline; }}
 a.ig-calbtn {{ display:inline-flex; align-items:center; gap:.4rem; margin:.2rem .35rem .2rem 0; padding:.45rem .8rem;
               border-radius:10px; background:#fff; border:1px solid var(--line); color:var(--royal) !important;
               font-size:.84rem; font-weight:700; text-decoration:none; }}
