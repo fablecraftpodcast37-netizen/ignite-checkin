@@ -186,7 +186,8 @@ CREATE TABLE IF NOT EXISTS events (
     about       TEXT,                         -- short description members read before registering
     map_url     TEXT,                         -- Google Maps link; built from the venue when empty
     rsvp_contacts TEXT,                       -- one 'Name, phone' per line
-    inviters    TEXT                          -- one name per line; asks "Who invited you?" when filled
+    inviters    TEXT,                         -- old pick-list of inviter names (no longer used for new events)
+    ask_invited INTEGER NOT NULL DEFAULT 0    -- 1 = members are asked to type who invited them
 );
 
 CREATE TABLE IF NOT EXISTS members (
@@ -371,6 +372,7 @@ MIGRATIONS = [
     ("attendance", "invited_by", "TEXT"),
     ("pre_registrations", "invited_by", "TEXT"),
     ("members", "gender", "TEXT"),
+    ("events", "ask_invited", "INTEGER NOT NULL DEFAULT 0"),
 ]
 DATA_VERSION = "intl-phones-1"   # bump when a one-off data upgrade is added
 
@@ -562,7 +564,7 @@ def set_app_setting(key: str, value: str):
 # ----- events ---------------------------------------------------------------
 EVENT_COLUMNS = """e.id, e.event_name, e.event_type, e.event_date, e.venue, e.is_open,
                    e.prereg_open, e.prereg_deadline, e.uses_checkin, e.created_at, e.flyer_bytes IS NOT NULL AS has_flyer,
-                   e.start_time, e.end_time, e.theme, e.about, e.map_url, e.rsvp_contacts, e.inviters,
+                   e.start_time, e.end_time, e.theme, e.about, e.map_url, e.rsvp_contacts, e.inviters, e.ask_invited,
                    (SELECT COUNT(*) FROM attendance a WHERE a.event_id = e.id) AS attendees,
                    (SELECT COUNT(*) FROM pre_registrations p WHERE p.event_id = e.id) AS preregs"""
 
@@ -612,7 +614,7 @@ def update_event(event_id, name, event_type, event_date, venue, is_open, prereg_
         )
 
 
-PAGE_FIELDS = ("start_time", "end_time", "theme", "about", "map_url", "rsvp_contacts", "inviters")
+PAGE_FIELDS = ("start_time", "end_time", "theme", "about", "map_url", "rsvp_contacts", "inviters", "ask_invited")
 
 
 def set_event_page(event_id: int, **fields):
@@ -621,15 +623,6 @@ def set_event_page(event_id: int, **fields):
     vals = [(str(fields[c]).strip() or None) if fields[c] is not None else None for c in cols]
     with closing(get_conn()) as conn, conn:
         conn.execute(f"UPDATE events SET {', '.join(c + ' = ?' for c in cols)} WHERE id = ?", (*vals, event_id))
-
-
-def last_inviters(exclude_id: int):
-    """The most recent inviter list from another event, so it doesn't have to be typed again."""
-    with closing(get_conn()) as conn:
-        row = conn.execute("""SELECT event_name, inviters FROM events
-                              WHERE id <> ? AND COALESCE(inviters, '') <> '' ORDER BY id DESC LIMIT 1""",
-                           (exclude_id,)).fetchone()
-        return (row["event_name"], row["inviters"]) if row else (None, "")
 
 
 def split_lines(text) -> list[str]:
@@ -642,8 +635,9 @@ def split_lines(text) -> list[str]:
     return out
 
 
-INVITE_SOMEONE_ELSE = "Someone else"
-INVITE_NOBODY = "No one, I came on my own"
+def asks_invited(ev: dict) -> bool:
+    """Events set up with the old pick-list still ask, now as a typed answer."""
+    return bool(ev.get("ask_invited")) or bool(split_lines(ev.get("inviters")))
 
 
 def set_event_flag(event_id: int, column: str, value: bool):
@@ -2200,6 +2194,12 @@ div.stButton > button, div.stFormSubmitButton > button, div.stDownloadButton > b
 .st-key-ig_footer_btn button {{ margin:0 auto; }}
 .st-key-ig_go {{ display:none; }}
 
+/* ---- a Save button that worked turns green until Done is pressed ---- */
+[class*="st-key-igsaved_"] [data-testid="stBaseButton-primaryFormSubmit"] {{
+    background:#1E7B47 !important; border-color:#1E7B47 !important; color:#fff !important;
+    box-shadow:0 10px 22px -14px rgba(30,123,71,.9) !important; animation:igPop .35s ease; }}
+@keyframes igPop {{ 0% {{ transform:scale(.96); }} 60% {{ transform:scale(1.03); }} 100% {{ transform:none; }} }}
+
 /* ---- cards made from keyed containers ---- */
 [class*="st-key-glass"] {{ background:#fff; border:1px solid var(--line); border-radius:18px; padding:1.1rem 1.2rem;
     box-shadow:0 12px 30px -26px rgba(31,26,51,.45); }}
@@ -2706,9 +2706,9 @@ def show_errors(errors: list[str]):
     st.error("**Please check the following:**\n\n" + "\n".join(f"- {e}" for e in errors))
 
 
-def phone_step(prefix: str, title: str, note: str, button: str, inviters=None):
+def phone_step(prefix: str, title: str, note: str, button: str, ask_invited: bool = False):
     """Step 1: the phone number. Returns {"phone", "country", "invited_by"} or None.
-    When the event has an inviter list, it also asks who invited them (optional)."""
+    When the event asks, the member types who invited them (optional)."""
     nonce = st.session_state.form_nonce
     with st.form(key=f"{prefix}_phone_form_{nonce}"):
         st.markdown(f'<div class="ig-formtitle">{esc(title)}</div><div class="ig-formnote">{esc(note)}</div>',
@@ -2718,10 +2718,10 @@ def phone_step(prefix: str, title: str, note: str, button: str, inviters=None):
         raw = c2.text_input("Phone number", placeholder="e.g. 024 123 4567", autocomplete="tel",
                             key=f"{prefix}_ph_{nonce}", max_chars=25)
         st.caption("Tip: you can type to search the country list.")
-        invited = None
-        if inviters:
-            invited = st.selectbox("Who invited you?", inviters + [INVITE_SOMEONE_ELSE, INVITE_NOBODY], index=None,
-                                   placeholder="Choose a name (optional)", key=f"{prefix}_inv_{nonce}")
+        invited = ""
+        if ask_invited:
+            invited = st.text_input("Who invited you? (optional)", placeholder="Type their name, e.g. Pastor Daniel Mensah",
+                                    max_chars=60, key=f"{prefix}_inv_{nonce}")
         go = st.form_submit_button(button, type="primary", width="stretch")
         st.markdown(SAFE_LINE, unsafe_allow_html=True)
     if not go:
@@ -2734,7 +2734,7 @@ def phone_step(prefix: str, title: str, note: str, button: str, inviters=None):
         show_errors([problem])
         return None
     return {"phone": phone, "country": country if country != "Other country" else country_from_number(phone),
-            "invited_by": invited if invited and invited != INVITE_NOBODY else (INVITE_NOBODY if invited else None)}
+            "invited_by": clean_text(invited, 60) or None}
 
 
 def details_step(prefix: str, pending: dict, title: str, note: str, button: str, source: str):
@@ -3056,7 +3056,7 @@ def checkin_page():
     if pending is None:
         found = phone_step("chk", "Your phone number",
                            "Enter the number you use with Ignite. If it's your first time, we'll ask for a few details next.",
-                           "Continue", split_lines(ev.get("inviters")))
+                           "Continue", asks_invited(ev))
         if found:
             member_id = find_member_id(found["phone"])
             if member_id:
@@ -3134,7 +3134,7 @@ def register_page():
     if pending is None:
         found = phone_step("reg", "Your phone number",
                            "Enter the number you use with Ignite. If we don't have it yet, we'll ask for a few details next.",
-                           "Continue", split_lines(ev.get("inviters")))
+                           "Continue", asks_invited(ev))
         if found:
             member_id = find_member_id(found["phone"])
             if member_id:
@@ -3666,6 +3666,29 @@ def admin_login():
 def notify(message: str):
     st.session_state.admin_notice = message
     log_action(message)
+    pressed = st.session_state.pop("_save_ctx", None)
+    if pressed:                                   # the Save button that led here turns green
+        st.session_state.setdefault("ig_saved", set()).add(pressed)
+
+
+def save_submit(label: str, key: str, **kwargs) -> bool:
+    """A form's Save button. After a successful save it turns green and reads
+    "✓ Saved", with a Done button beside it; Done puts it back to normal.
+    Pressing ✓ Saved again simply saves again."""
+    saved = st.session_state.setdefault("ig_saved", set())
+    if key not in saved:
+        pressed = st.form_submit_button(label, **kwargs)
+    else:
+        with st.container(key=f"igsaved_{key}"):
+            c1, c2 = st.columns([2, 1])
+            pressed = c1.form_submit_button("✓ Saved", type="primary", width="stretch", icon=None)
+            done = c2.form_submit_button("Done", width="stretch")
+        if done:
+            saved.discard(key)
+            st.rerun()
+    if pressed:
+        st.session_state["_save_ctx"] = key
+    return pressed
 
 
 def event_picker(label: str, key: str, events: list[dict]) -> dict:
@@ -3790,8 +3813,8 @@ def birthdays_section():
         text = st.text_area("Message that opens in WhatsApp", value=get_app_setting("birthday_message") or DEFAULT_BIRTHDAY_MESSAGE,
                             height=110, help="{name} is replaced with the member's first name.")
         c1, c2 = st.columns(2)
-        saved = c1.form_submit_button("Save message", type="primary")
-        reset = c2.form_submit_button("Use the default message")
+        saved = save_submit("Save message", "bday_msg", type="primary")
+        reset = st.form_submit_button("Use the default message", type="tertiary")
     if saved or reset:
         set_app_setting("birthday_message", "" if reset else text.strip())
         notify("Birthday message updated.")
@@ -3913,7 +3936,7 @@ def prereg_section(ev: dict, base):
         st.caption("After this time the registration link shows a “registration has closed” message. "
                    + ("Nothing else happens: this event has no check-in at the venue." if prereg_only
                       else "Day-of check-in is not affected."))
-        save_dl = st.form_submit_button("Save closing time", type="primary")
+        save_dl = save_submit("Save closing time", f"deadline_{ev['id']}", type="primary")
     if save_dl:
         problem = deadline_problem(deadline, ev.get("event_date"))
         if problem:
@@ -3994,7 +4017,7 @@ def details_section(ev: dict):
         is_open = c6.toggle("Day-of check-in open", value=bool(ev["is_open"]),
                             help="Ignored for pre-registration-only events.")
         deadline = deadline_inputs(f"edit_{ev['id']}", ev.get("prereg_deadline"))
-        save = st.form_submit_button("Save changes", type="primary")
+        save = save_submit("Save changes", f"event_{ev['id']}", type="primary")
     if save:
         problem = deadline_problem(deadline, ev_date.isoformat() if ev_date else None)
         if not name.strip():
@@ -4012,9 +4035,6 @@ def details_section(ev: dict):
 def page_details_section(ev: dict):
     st.caption("This is the information card members see under the flyer on the registration and check-in pages. "
                "Fill in only what you need. Anything left empty simply doesn't show.")
-    copied_from, old_list = (None, "")
-    if not ev.get("inviters"):
-        copied_from, old_list = last_inviters(ev["id"])
     with st.form(f"page_details_{ev['id']}"):
         c1, c2 = st.columns(2)
         slots = [f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 15, 30, 45)]
@@ -4031,15 +4051,11 @@ def page_details_section(ev: dict):
                                      "map search for the venue name instead.")
         rsvp = st.text_area("Contacts for questions (one per line)", value=ev.get("rsvp_contacts") or "", height=90,
                             placeholder="Brother Kofi, 024 123 4567\nSister Ama, 055 765 4321")
-        st.markdown("**Who invited you?**")
-        inviters = st.text_area("Names members can choose from (one per line). Leave empty to not ask.",
-                                value=ev.get("inviters") or old_list, height=110,
-                                placeholder="Pastor Daniel\nEvangelist Grace\nUsher team")
-        if copied_from:
-            st.caption(f"Filled in from “{copied_from}”. Press Save to use the same list here, or clear it.")
-        st.caption("Members can also pick “Someone else” or “No one, I came on my own”. The answer shows in the "
-                   "pre-registration and check-in lists, with a count per name.")
-        save = st.form_submit_button("Save", type="primary")
+        ask = st.checkbox("Ask members “Who invited you?”", value=asks_invited(ev),
+                          help="Members type the name themselves. It's optional for them.")
+        st.caption("Their answer shows in the pre-registration and check-in lists, with a count per name. "
+                   "Names typed with different capitals or spacing are counted together.")
+        save = save_submit("Save", f"page_{ev['id']}", type="primary")
     if save:
         if start is None and end is not None:
             st.error("Add a start time as well, or clear the end time.")
@@ -4048,7 +4064,7 @@ def page_details_section(ev: dict):
             st.error("The map link should start with https://")
             return
         set_event_page(ev["id"], start_time=start or "", end_time=end or "", theme=theme, about=about,
-                       map_url=map_url, rsvp_contacts=rsvp, inviters="\n".join(split_lines(inviters)))
+                       map_url=map_url, rsvp_contacts=rsvp, inviters="", ask_invited=1 if ask else 0)
         notify(f"Saved what members see for “{ev['event_name']}”.")
         st.rerun()
     st.markdown("**Preview**")
@@ -4065,7 +4081,11 @@ def invited_summary(df: pd.DataFrame, what: str):
     if named.empty:
         return
     with st.expander(f":material/group_add: Who invited people · {len(named)} of {len(df)} answered"):
-        counts = (named["Invited By"].value_counts().rename_axis("Invited By").reset_index(name=what))
+        # members type the names, so "pastor daniel" and "Pastor  Daniel" count as one person
+        keyed = named.assign(_k=named["Invited By"].map(lambda v: re.sub(r"\s+", " ", str(v)).strip().casefold()))
+        shown = keyed.groupby("_k")["Invited By"].agg(lambda v: v.value_counts().index[0])
+        counts = (keyed["_k"].value_counts().rename_axis("_k").reset_index(name=what)
+                  .assign(**{"Invited By": lambda d: d["_k"].map(shown)})[["Invited By", what]])
         c1, c2 = st.columns([1, 1.4])
         c1.dataframe(counts, hide_index=True, width="stretch")
         c2.bar_chart(counts.set_index("Invited By"), color=ROYAL, horizontal=True)
@@ -4088,7 +4108,7 @@ def flyer_section(ev: dict):
         st.rerun()
     with st.form(f"flyer_form_{ev['id']}", clear_on_submit=True):
         new_file = st.file_uploader("Upload a new flyer" if current else "Upload a flyer", type=["jpg", "jpeg", "png"])
-        save = st.form_submit_button("Save flyer", type="primary")
+        save = save_submit("Save flyer", f"flyer_{ev['id']}", type="primary")
     if save:
         if new_file is None:
             st.warning("Choose an image first.")
@@ -4287,7 +4307,7 @@ def member_detail(member_id: int):
             b_day, b_month = birthday_inputs(f"edit_member_{member_id}", False, m.get("birth_day"), m.get("birth_month"))
             is_minor = st.checkbox("Under 18", value=bool(m["is_minor"]))
             parent = st.text_input("Parent/guardian phone", value=m["parent_guardian_phone"] or "")
-            save = st.form_submit_button("Save changes", type="primary")
+            save = save_submit("Save changes", f"member_{member_id}", type="primary")
         if save:
             num_country = country_from_number(m["phone_number"])
             data = {
@@ -4380,7 +4400,7 @@ def membership_link_section():
         st.warning("The app's web address couldn't be detected. Enter it once and it will be remembered.")
         with st.form("save_base_url"):
             entered = st.text_input("App address", placeholder="https://ignite-checkin-xxxx.streamlit.app")
-            if st.form_submit_button("Save address", type="primary"):
+            if save_submit("Save address", "base_url", type="primary"):
                 entered = entered.strip().rstrip("/")
                 if base_url_ok(entered):
                     set_app_setting("app_base_url", entered)
@@ -4407,7 +4427,7 @@ def membership_link_section():
         with st.form("wa_link_form"):
             url = st.text_input("WhatsApp group or community invite link", value=get_app_setting("whatsapp_group_url"),
                                 placeholder="https://chat.whatsapp.com/…")
-            if st.form_submit_button("Save link"):
+            if save_submit("Save link", "wa_group"):
                 if url.strip() and not url.strip().startswith("https://"):
                     st.error("Paste the full invite link, starting with https://")
                 else:
@@ -4784,7 +4804,8 @@ def mc_session_form(key: str, sess: dict | None = None):
         price = st.text_input("Payment instructions (paid sessions)", value=sess.get("price_note") or "",
                               placeholder="e.g. GHS 150 by MoMo to 024 000 0000 (Ignite Prayer Network)")
         active = st.toggle("Active (open for enrolment and the live room)", value=bool(sess.get("active_status", 1)))
-        saved = st.form_submit_button("Save session" if sess else "Create session", type="primary")
+        saved = (save_submit("Save session", f"mc_{sess['id']}", type="primary") if sess
+                 else st.form_submit_button("Create session", type="primary"))
     if not saved:
         return None
     errors = []
@@ -4892,7 +4913,7 @@ def mc_links_section():
     st.markdown(f"Currently: **{fmt_phone(current)}**")
     with st.form("pa_number_form"):
         raw, country = admin_phone_input("pa_wa", "PA's WhatsApp number")
-        if st.form_submit_button("Save PA number", type="primary"):
+        if save_submit("Save PA number", "pa_number", type="primary"):
             phone = to_intl(raw, country)
             if phone_problem(phone):
                 st.error(phone_problem(phone))
@@ -4946,7 +4967,7 @@ def meet_settings_section():
                             placeholder="Paste your link, e.g. https://meet.google.com/xxx-xxxx-xxx")
         is_open = st.toggle("Room open", value=get_app_setting("meet_open", "1") == "1",
                             help="On: members can join through the Ignite link. Off: the link says the room isn't open.")
-        if st.form_submit_button("Save", type="primary"):
+        if save_submit("Save", "meet_link", type="primary"):
             if url.strip() and not url.strip().startswith("https://"):
                 st.error("Paste the full Meet link, starting with https://")
             else:
@@ -4962,7 +4983,7 @@ def meet_settings_section():
                                     int(meet_setting("meet_grace")))
             min_pct = c2.number_input("And were in the call for at least this % of the prayer", 0, 100,
                                       int(meet_setting("meet_min_pct")), step=5)
-            if st.form_submit_button("Save rules"):
+            if save_submit("Save rules", "meet_rules"):
                 set_app_setting("meet_grace", str(int(grace)))
                 set_app_setting("meet_min_pct", str(int(min_pct)))
                 notify("Updated the stayed-to-the-end rules.")
@@ -5119,6 +5140,7 @@ def meet_tab():
         download_pair(full, "Ignite_prayer_link_log", "Prayer link log", "meet_all_dl")
 
 def admin_page():
+    st.session_state.pop("_save_ctx", None)
     if not admin_is_authenticated():
         admin_login()
         return
@@ -5135,8 +5157,9 @@ def admin_page():
         if st.button("Sign out", width="stretch"):
             leave_admin()
     notice = st.session_state.pop("admin_notice", None)
+    notice_slot = st.container()          # always present, so the tabs below keep their place after a save
     if notice:
-        st.success(notice)
+        notice_slot.success(notice)
 
     if user["role"] == "Usher":
         tabs = st.tabs([":material/fact_check: Check-ins", ":material/person: My account"])
