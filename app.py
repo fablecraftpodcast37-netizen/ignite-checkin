@@ -1281,8 +1281,8 @@ def search_members(term: str = "", country: str = "All countries") -> pd.DataFra
                   m.birth_day, m.birth_month,
                   CASE WHEN m.is_minor THEN 'Yes' ELSE '' END AS "Under 18",
                   (SELECT COUNT(*) FROM attendance a WHERE a.member_id = m.id) AS "Events Attended",
-                  (SELECT strftime('%Y-%m-%d', MAX(a.check_in_timestamp))
-                     FROM attendance a WHERE a.member_id = m.id) AS "Last Seen",
+                  COALESCE((SELECT strftime('%Y-%m-%d', MAX(a.check_in_timestamp))
+                     FROM attendance a WHERE a.member_id = m.id), 'Never') AS "Last Seen",
                   strftime('%Y-%m-%d', m.created_at) AS "Joined",
                   COALESCE(m.source, '') AS "Joined Via"
            FROM members m
@@ -1462,6 +1462,24 @@ def verify_password(password: str, stored: str) -> bool:
         return hmac.compare_digest(digest.hex(), expected)
     except (ValueError, TypeError):
         return False
+
+
+COMMON_PASSWORDS = {"password", "password1", "12345678", "123456789", "1234567890", "qwerty123", "11111111",
+                    "00000000", "iloveyou", "admin123", "letmein1", "welcome1", "abcd1234", "password123",
+                    "ignite123", "ignite2026", "igniteadmin", "jesus123", "godisgood", "prayer123"}
+
+
+def password_problem(pw: str, username: str = "") -> str | None:
+    """Plain-language reason a team password isn't good enough, or None."""
+    pw = pw or ""
+    if len(pw) < 8:
+        return "Passwords need at least 8 characters."
+    low = pw.lower()
+    if low in COMMON_PASSWORDS or len(set(low)) <= 2:
+        return "That password is too easy to guess. Try a short phrase, like three words together."
+    if username and username.strip().lower() in low:
+        return "The password shouldn't contain the username."
+    return None
 
 
 def password_needs_upgrade(stored: str) -> bool:
@@ -2143,7 +2161,7 @@ header[data-testid="stHeader"] {{ background: transparent; }}
 .ig-chip {{ display:inline-flex; align-items:center; gap:.2rem; background:#fff; border:1px solid var(--line);
            border-radius:999px; padding:.4rem .85rem; font-size:.92rem; font-weight:600; color:var(--ink); margin:.1rem 0 .5rem; }}
 .ig-chip .ig-ico {{ color:var(--royal); }}
-.ig-note {{ background:#fff; border:1px solid var(--line); border-left:3px solid var(--gold); border-radius:0 12px 12px 0;
+.ig-note {{ background:rgba(201,162,75,.09); border:1px solid rgba(201,162,75,.32); border-radius:14px;
            padding:.75rem .95rem; font-size:.9rem; color:var(--ink); margin:.4rem 0 1rem; line-height:1.55; }}
 [data-baseweb="input"] input, [data-baseweb="select"] > div {{ font-size:.98rem; }}
 
@@ -2229,6 +2247,9 @@ div.stButton > button, div.stFormSubmitButton > button, div.stDownloadButton > b
 .st-key-ig_footer_btn button {{ margin:0 auto; }}
 .st-key-ig_go {{ display:none; }}
 
+/* ---- keyboard focus is always visible ---- */
+.stApp a:focus-visible, .stApp button:focus-visible, .stApp [role="tab"]:focus-visible,
+.stApp summary:focus-visible {{ outline:2px solid var(--royal) !important; outline-offset:2px; border-radius:10px; }}
 /* ---- a Save button that worked turns green until Done is pressed ---- */
 [class*="st-key-igsaved_"] [data-testid="stBaseButton-primaryFormSubmit"] {{
     background:#1E7B47 !important; border-color:#1E7B47 !important; color:#fff !important;
@@ -3053,40 +3074,56 @@ MOTION_CSS = f"""<style>
 .ig-section::before {{ content:""; width:.55rem; height:.55rem; border-radius:3px; transform:rotate(45deg);
                       background:linear-gradient(135deg, var(--gold), var(--flame)); flex-shrink:0; }}
 
-/* ---- buttons: deeper gradient, soft glow, a little lift ---- */
+/* ---- buttons: deeper gradient, soft glow; press feedback on every device, lift only with a mouse ---- */
+.stApp {{ --ease-out: cubic-bezier(.23, 1, .32, 1); }}
 .stApp [data-testid="stBaseButton-primary"], .stApp [data-testid="stBaseButton-primaryFormSubmit"] {{
     background:linear-gradient(135deg, #5B37A0 0%, var(--royal) 50%, var(--royal-dark) 100%) !important;
     border:none !important; box-shadow:0 14px 26px -14px rgba(75,46,131,.85), inset 0 1px 0 rgba(255,255,255,.18);
-    transition:transform .18s ease, box-shadow .18s ease, filter .18s ease; }}
-.stApp [data-testid="stBaseButton-primary"]:hover, .stApp [data-testid="stBaseButton-primaryFormSubmit"]:hover {{
-    transform:translateY(-1px); filter:brightness(1.06);
-    box-shadow:0 18px 30px -14px rgba(75,46,131,.9), 0 0 0 3px rgba(201,162,75,.25); }}
-.stApp [data-testid="stBaseButton-primary"]:active, .stApp [data-testid="stBaseButton-primaryFormSubmit"]:active {{
-    transform:scale(.98); }}
+    min-height:3rem; transition:transform 160ms var(--ease-out), box-shadow 200ms ease, filter 200ms ease; }}
+@media (hover: hover) and (pointer: fine) {{
+  .stApp [data-testid="stBaseButton-primary"]:hover, .stApp [data-testid="stBaseButton-primaryFormSubmit"]:hover {{
+      transform:translateY(-1px); filter:brightness(1.06);
+      box-shadow:0 18px 30px -14px rgba(75,46,131,.9), 0 0 0 3px rgba(201,162,75,.25); }}
+  a.ig-calbtn:hover, .ig-rsvp-acts a:hover {{ transform:translateY(-1px); }}
+}}
+.stApp [data-testid="stBaseButton-primary"]:active, .stApp [data-testid="stBaseButton-primaryFormSubmit"]:active,
+a.ig-calbtn:active, .ig-rsvp-acts a:active {{ transform:scale(.97); }}
+a.ig-calbtn, .ig-rsvp-acts a {{ transition:transform 160ms var(--ease-out); }}
+a.ig-calbtn {{ min-height:2.75rem; }}
+.ig-rsvp-acts a {{ height:2.75rem !important; min-width:2.75rem !important; }}
 [data-baseweb="input"]:focus-within, [data-baseweb="select"] > div:focus-within, [data-baseweb="textarea"]:focus-within {{
     box-shadow:0 0 0 3px rgba(75,46,131,.14) !important; border-color:var(--royal) !important;
-    transition:box-shadow .2s ease; }}
+    transition:box-shadow 200ms ease; }}
 
-/* ---- entrance motion: things rise in gently, one after another ---- */
-@keyframes igRise {{ from {{ opacity:0; transform:translateY(14px); }} to {{ opacity:1; transform:none; }} }}
-@keyframes igSettle {{ from {{ opacity:0; transform:scale(1.03); }} to {{ opacity:1; transform:none; }} }}
-.st-key-flyer_banner img {{ animation:igSettle .7s cubic-bezier(.2,.7,.2,1) both; }}
-.ig-kicker, .ig-h1, .ig-lead {{ animation:igRise .55s cubic-bezier(.2,.7,.2,1) both; }}
-.ig-h1 {{ animation-delay:.05s; }} .ig-lead {{ animation-delay:.1s; }}
-.ig-ticket {{ animation:igRise .55s .14s cubic-bezier(.2,.7,.2,1) both; }}
-.ig-info {{ animation:igRise .55s .2s cubic-bezier(.2,.7,.2,1) both; }}
-.ig-note {{ animation:igRise .5s .24s cubic-bezier(.2,.7,.2,1) both; }}
-[data-testid="stForm"] {{ animation:igRise .6s .28s cubic-bezier(.2,.7,.2,1) both; }}
+/* ---- entrance: the page settles in once, top to bottom (short steps, nothing waits on it) ---- */
+@keyframes igRise {{ from {{ opacity:0; transform:translateY(10px); }} to {{ opacity:1; transform:none; }} }}
+@keyframes igSettle {{ from {{ opacity:0; transform:scale(1.02); }} to {{ opacity:1; transform:none; }} }}
+@keyframes igFade {{ from {{ opacity:0; }} to {{ opacity:1; }} }}
+.st-key-flyer_banner img {{ animation:igSettle 520ms var(--ease-out) both; }}
+.ig-kicker {{ animation:igRise 420ms var(--ease-out) both; }}
+.ig-h1 {{ animation:igRise 420ms 40ms var(--ease-out) both; }}
+.ig-lead {{ animation:igRise 420ms 80ms var(--ease-out) both; }}
+.ig-ticket {{ animation:igRise 420ms 120ms var(--ease-out) both; }}
+.ig-info {{ animation:igRise 420ms 160ms var(--ease-out) both; }}
+.ig-note {{ animation:igRise 420ms 200ms var(--ease-out) both; }}
+[data-testid="stForm"] {{ animation:igRise 420ms 240ms var(--ease-out) both; }}
+
+/* ---- the "you're in" moment: the seal settles and a gold ring glows out once ---- */
+.ig-done-seal {{ position:relative; animation:igSettle 380ms var(--ease-out) both; }}
+.ig-done-success .ig-done-seal::after {{ content:""; position:absolute; inset:-8px; border-radius:50%;
+    border:2px solid rgba(201,162,75,.75); pointer-events:none; animation:igRing 1100ms 150ms var(--ease-out) both; }}
+@keyframes igRing {{ from {{ opacity:.9; transform:scale(.85); }} to {{ opacity:0; transform:scale(1.5); }} }}
+
+/* ---- reduced motion: no movement, just a gentle fade ---- */
 @media (prefers-reduced-motion: reduce) {{
-  .stApp *, .stApp *::before {{ animation:none !important; transition:none !important; }}
+  .stApp *, .stApp *::before, .stApp *::after {{ animation-name:igFade !important; transition:none !important; }}
+  .ig-done-success .ig-done-seal::after {{ display:none; }}
 }}
 </style>"""
 
 
 def page_top():
     """Flyer slot at the very top, then the brand. Returns the flyer slot."""
-    st.markdown(_with_heading_font(INFO_CSS), unsafe_allow_html=True)    # two separate blocks: joined on one line, the
-    st.markdown(MOTION_CSS, unsafe_allow_html=True)  # second <style> would show up as text
     banner = st.container(key="flyer_banner")
     brand_row()
     return banner
@@ -4001,32 +4038,123 @@ def birthdays_section():
                 "is already registered only gets asked for their birthday.", icon=":material/lightbulb:")
 
 
-def overview_tab():
-    birthdays_today_panel()
-    s = overview_stats()
-    c = st.columns(6)
-    c[0].metric("Members", s["members"])
-    c[1].metric("Living abroad", s["abroad"])
-    c[2].metric("Events", s["events"], help=f"{s['open_events']} open for check-in")
-    c[3].metric("Pre-registrations", s["preregs"])
-    c[4].metric("Check-ins", s["checkins"])
-    c[5].metric("Checked in today", s["today"])
-    if DB_IS_PERSISTENT:
-        st.success(f"Data is saved on the permanent disk ({DB_PATH}). Restarts and updates don't erase it. "
-                   "A backup now and then is still wise.", icon=":material/verified:")
+ADMIN_CSS = f"""<style>
+.stApp .stMarkdown .ig-greet, .ig-greet {{ font-family:'Cormorant Garamond', Georgia, serif !important; font-size:2.1rem; font-weight:700; color:var(--ink);
+            line-height:1.1; margin:.2rem 0 .15rem; }}
+.ig-greet-sub {{ color:var(--muted); font-size:.95rem; margin-bottom:1.1rem; }}
+.ig-spot {{ display:flex; border-radius:20px; overflow:hidden; background:#FFFDF9; border:1px solid var(--line);
+           box-shadow:0 24px 40px -32px rgba(31,26,51,.55); margin-bottom:1rem; }}
+.ig-spot-date {{ background:linear-gradient(160deg, #2A2147, var(--ink)); color:#EDE7F7; min-width:118px; display:flex;
+                flex-direction:column; align-items:center; justify-content:center; padding:1.2rem .8rem;
+                letter-spacing:.2em; font-size:.72rem; font-weight:700; }}
+.stApp .stMarkdown .ig-spot-date b {{ font-family:'Cormorant Garamond', Georgia, serif !important; font-size:3rem; letter-spacing:0;
+                  color:#fff; line-height:1; margin:.15rem 0; }}
+.ig-spot-date span {{ color:var(--gold); }}
+.ig-spot-main {{ padding:1.2rem 1.4rem 1.3rem; flex:1; min-width:0; }}
+.ig-spot-kicker {{ font-size:.7rem; font-weight:800; letter-spacing:.18em; text-transform:uppercase; color:var(--gold-text); }}
+.stApp .stMarkdown .ig-spot-name, .ig-spot-name {{ font-family:'Cormorant Garamond', Georgia, serif !important; font-size:1.8rem; font-weight:700;
+                color:var(--ink); line-height:1.15; margin:.2rem 0 .2rem; }}
+.ig-spot-meta {{ color:var(--muted); font-size:.9rem; margin-bottom:.9rem; }}
+.ig-bars {{ width:100%; max-width:40rem; }}
+.stApp .stMarkdown .ig-pbar {{ display:flex !important; align-items:center; gap:.8rem; width:100% !important; margin:.55rem 0; }}
+.stApp .stMarkdown .ig-pbar-k {{ flex:0 0 6.5rem; font-size:.82rem; font-weight:700; color:var(--ink); }}
+.stApp .stMarkdown .ig-pbar-t {{ display:block !important; flex:1 1 auto; min-width:4rem; height:.65rem; border-radius:999px;
+    background:var(--sand); overflow:hidden; }}
+.stApp .stMarkdown .ig-pbar-t i {{ display:block !important; height:100%; border-radius:999px; transform-origin:left;
+    animation:igGrow 700ms 120ms cubic-bezier(.23,1,.32,1) both; }}
+.stApp .stMarkdown .ig-pbar-v {{ flex:0 0 2.5rem; font-weight:800; color:var(--ink); text-align:right; font-variant-numeric:tabular-nums; }}
+@keyframes igGrow {{ from {{ transform:scaleX(0.02); }} to {{ transform:none; }} }}
+.ig-glance {{ display:flex; flex-wrap:wrap; background:#FFFDF9; border:1px solid var(--line); border-radius:18px;
+             padding:.4rem .3rem; margin-bottom:1.2rem; }}
+.ig-glance-i {{ flex:1 1 9rem; padding:.7rem 1rem; border-right:1px solid var(--line); }}
+.ig-glance-i:last-child {{ border-right:none; }}
+.stApp .stMarkdown .ig-glance-v, .ig-glance-v {{ font-family:'Cormorant Garamond', Georgia, serif !important; font-size:1.9rem; font-weight:700; color:var(--ink);
+               line-height:1; font-variant-numeric:tabular-nums; }}
+.ig-glance-k {{ font-size:.76rem; color:var(--muted); margin-top:.3rem; font-weight:600; }}
+.ig-glance-i.ig-attn .ig-glance-v {{ color:var(--gold-text); }}
+.ig-glance-i.ig-attn .ig-glance-k::before {{ content:""; display:inline-block; width:.45rem; height:.45rem; border-radius:50%;
+    background:var(--flame); margin-right:.35rem; vertical-align:1px; }}
+@media (max-width: 640px) {{ .ig-spot {{ flex-direction:column; }} .ig-spot-date {{ flex-direction:row; gap:.6rem; min-width:0; }}
+  .ig-glance-i {{ border-right:none; border-bottom:1px solid var(--line); }} }}
+@media (prefers-reduced-motion: reduce) {{ .ig-pbar-t i {{ animation:none; }} }}
+</style>"""
+
+
+def greeting_text() -> str:
+    hour = datetime.now(timezone.utc).hour           # Ghana time is UTC
+    part = "Good morning" if hour < 12 else "Good afternoon" if hour < 17 else "Good evening"
+    name = (current_admin().get("name") or "").strip()
+    first = first_name(name) if name and name != "Main administrator" else ""
+    return f"{part}, {first}" if first else part
+
+
+def spotlight_event():
+    """The next event coming up; if none is coming, the most recent one."""
+    events = get_events()
+    today = today_local().isoformat()
+    coming = sorted((e for e in events if (e.get("event_date") or "") >= today), key=lambda e: e["event_date"])
+    if coming:
+        return coming[0], True
+    return (events[0], False) if events else (None, False)
+
+
+def spotlight_html(ev: dict, upcoming: bool) -> str:
+    try:
+        d = date.fromisoformat(ev["event_date"]) if ev.get("event_date") else None
+    except ValueError:
+        d = None
+    if d:
+        date_block = f'{d.strftime("%b").upper()}<b>{d.day}</b><span>{d.strftime("%a").upper()}</span>'
+        days = (d - today_local()).days
+        when = ("Today" if days == 0 else "Tomorrow" if days == 1 else f"In {days} days" if days > 1
+                else f"{-days} day{'s' if days != -1 else ''} ago")
     else:
-        st.warning("This copy isn't using a permanent disk, so a restart could clear the data. On Render, attach a "
-                   "disk at /data. Until then, download a backup from the **Backup** tab after every event.",
-                   icon=":material/backup:")
+        date_block, when = "DATE<b>?</b><span>TBC</span>", "Date to be set"
+    kicker = ("Next up · " if upcoming else "Most recent · ") + when
+    meta = " · ".join(x for x in (ev.get("venue"), time_range(ev)) if x) or PUBLIC_TYPE_NAMES.get(ev["event_type"], "")
+    reg, came = int(ev.get("preregs") or 0), int(ev.get("attendees") or 0)
+    top = max(reg, came, 1)
+    bars = (f'<div class="ig-pbar"><span class="ig-pbar-k">Registered</span><span class="ig-pbar-t">'
+            f'<i style="width:{reg * 100 / top:.0f}%;background:{GOLD}"></i></span><span class="ig-pbar-v">{reg}</span></div>'
+            f'<div class="ig-pbar"><span class="ig-pbar-k">Arrived</span><span class="ig-pbar-t">'
+            f'<i style="width:{came * 100 / top:.0f}%;background:{ROYAL}"></i></span><span class="ig-pbar-v">{came}</span></div>')
+    return (f'<div class="ig-spot"><div class="ig-spot-date">{date_block}</div><div class="ig-spot-main">'
+            f'<div class="ig-spot-kicker">{esc(kicker)}</div><div class="ig-spot-name">{esc(ev["event_name"])}</div>'
+            f'<div class="ig-spot-meta">{esc(meta)}</div><div class="ig-bars">{bars}</div></div></div>')
+
+
+def glance_html(items) -> str:
+    cells = "".join(f'<div class="ig-glance-i{" ig-attn" if attn else ""}"><div class="ig-glance-v">{value}</div>'
+                    f'<div class="ig-glance-k">{esc(label)}</div></div>' for label, value, attn in items)
+    return f'<div class="ig-glance">{cells}</div>'
+
+
+def overview_tab():
+    st.markdown(_with_heading_font(ADMIN_CSS), unsafe_allow_html=True)
+    st.markdown(f'<div class="ig-greet">{esc(greeting_text())}</div>'
+                f'<div class="ig-greet-sub">{today_local().strftime("%A, %d %B %Y").replace(", 0", ", ")} · '
+                "here's where things stand.</div>", unsafe_allow_html=True)
+    ev, upcoming = spotlight_event()
+    if ev:
+        st.markdown(spotlight_html(ev, upcoming), unsafe_allow_html=True)
+    s = overview_stats()
     mc = query_df("""SELECT
             (SELECT COUNT(*) FROM masterclass_registrations WHERE payment_status = 'Pending Verification') AS pending,
             (SELECT COUNT(*) FROM masterclass_registrations) AS mc_total,
             (SELECT COUNT(DISTINCT phone_number) FROM google_meet_tracker WHERE tracking_date = date('now', '-6 hours')) AS meet_today
         """).iloc[0]
-    m = st.columns(3)
-    m[0].metric("Masterclass registrations", int(mc["mc_total"]))
-    m[1].metric("Payments waiting for the PA", int(mc["pending"]))
-    m[2].metric("Joined prayer line today", int(mc["meet_today"]))
+    pending = int(mc["pending"])
+    st.markdown(glance_html([
+        ("Members", s["members"], False), ("Living abroad", s["abroad"], False),
+        ("Checked in today", s["today"], False), ("At prayer tonight", int(mc["meet_today"]), False),
+        ("Masterclass sign-ups", int(mc["mc_total"]), False),
+        ("Payments to confirm" if pending else "Payments to confirm", pending, pending > 0),
+    ]), unsafe_allow_html=True)
+    if not DB_IS_PERSISTENT:
+        st.warning("This copy isn't using a permanent disk, so a restart could clear the data. On Render, attach a "
+                   "disk at /data. Until then, download a backup from the **Backup** tab after every event.",
+                   icon=":material/backup:")
+    birthdays_today_panel()
     summary = events_summary()
     if summary.empty:
         st.caption("No events yet. Create your first one in the **Events** tab.")
@@ -4038,6 +4166,9 @@ def overview_tab():
                  stack=False, color=[GOLD, ROYAL], x_label="People", y_label="")
     summary["Date"] = summary["Date"].map(fmt_date)
     st.dataframe(summary.drop(columns=["id"]), hide_index=True, width="stretch")
+    st.caption(f"{s['events']} event(s) in total, {s['open_events']} open for check-in · "
+               f"{s['preregs']} pre-registrations and {s['checkins']} check-ins all time"
+               + (" · saved on the permanent disk" if DB_IS_PERSISTENT else ""))
 
 
 # ---------------------------------------------------------------------------
@@ -4747,10 +4878,95 @@ def import_section():
         st.rerun()
 
 
+def _name_key(name: str) -> str:
+    """'Ama  Serwaa Mensah' and 'mensah ama serwaa' give the same key."""
+    words = re.sub(r"[^a-z\s]", " ", (name or "").casefold()).split()
+    return " ".join(sorted(words))
+
+
+def possible_duplicates() -> list[list[dict]]:
+    """Groups of member records that look like the same person (same name, different
+    phone number). The phone number is unique, so these can only come from someone
+    signing up again with another number."""
+    with closing(get_conn()) as conn:
+        rows = [dict(r) for r in conn.execute(
+            """SELECT m.id, m.full_name, m.phone_number, m.email, strftime('%Y-%m-%d', m.created_at) AS joined,
+                      (SELECT COUNT(*) FROM attendance a WHERE a.member_id = m.id) AS checkins,
+                      (SELECT COUNT(*) FROM pre_registrations p WHERE p.member_id = m.id) AS preregs
+               FROM members m""")]
+    groups: dict[str, list[dict]] = {}
+    for r in rows:
+        key = _name_key(r["full_name"])
+        if len(key.split()) >= 2:                      # one-word names are too common to match on
+            groups.setdefault(key, []).append(r)
+    return [sorted(g, key=lambda r: r["joined"] or "") for g in groups.values() if len(g) > 1]
+
+
+MERGE_FILL = ("email", "whatsapp_number", "country", "emergency_contact_name", "emergency_contact_phone",
+              "parent_guardian_phone", "birth_day", "birth_month", "gender")
+
+
+def merge_members(keep_id: int, drop_id: int) -> dict:
+    """Fold one member record into another, in one transaction. Registrations and check-ins
+    move across; where both records have one for the same event, it's counted once.
+    Details missing on the kept record are filled in from the other."""
+    if keep_id == drop_id:
+        raise ValueError("Pick two different records.")
+    with closing(get_conn()) as conn, conn:
+        moved = {}
+        # check-ins are read-only (their server times can't be edited), so they're copied across with
+        # the original time and the old copy removed; an event both records attended is counted once
+        cur = conn.execute("""INSERT OR IGNORE INTO attendance (member_id, event_id, check_in_timestamp, invited_by)
+                              SELECT ?, event_id, check_in_timestamp, invited_by FROM attendance WHERE member_id = ?""",
+                           (keep_id, drop_id))
+        moved["attendance"] = cur.rowcount
+        conn.execute("DELETE FROM attendance WHERE member_id = ?", (drop_id,))
+        cur = conn.execute("UPDATE OR IGNORE pre_registrations SET member_id = ? WHERE member_id = ?", (keep_id, drop_id))
+        moved["pre_registrations"] = cur.rowcount
+        conn.execute("DELETE FROM pre_registrations WHERE member_id = ?", (drop_id,))   # same event twice: keep one
+        sets = ", ".join(f"{c} = COALESCE(NULLIF({c}, ''), (SELECT {c} FROM members WHERE id = :drop))" for c in MERGE_FILL)
+        conn.execute(f"UPDATE members SET {sets} WHERE id = :keep", {"keep": keep_id, "drop": drop_id})
+        conn.execute("DELETE FROM members WHERE id = ?", (drop_id,))
+    return moved
+
+
+def duplicates_section():
+    groups = possible_duplicates()
+    st.caption("Each phone number can only belong to one member, so nobody is ever counted twice for the same "
+               "number. The only way a person appears twice is signing up again with a different number. "
+               "Those look-alikes are listed here so you can fold them into one record.")
+    if not groups:
+        st.success("No look-alike records. Every member appears once.", icon=":material/verified:")
+        return
+    st.markdown(f"**{len(groups)} possible duplicate{'s' if len(groups) != 1 else ''}**")
+    for gi, group in enumerate(groups):
+        with st.container(border=True):
+            st.markdown(f"**{esc(group[0]['full_name'])}** appears {len(group)} times")
+            st.dataframe(pd.DataFrame([{"Name": r["full_name"], "Phone": fmt_phone(r["phone_number"]),
+                                        "Email": r["email"] or "", "Joined": r["joined"], "Registrations": r["preregs"],
+                                        "Check-ins": r["checkins"]} for r in group]), hide_index=True, width="stretch")
+            labels = {r["id"]: f"{fmt_phone(r['phone_number'])} (joined {r['joined']})" for r in group}
+            c1, c2 = st.columns([3, 2], vertical_alignment="bottom")
+            keep = c1.selectbox("Keep this record (its phone number stays)", list(labels), format_func=labels.get,
+                                key=f"dup_keep_{gi}_{group[0]['id']}")
+            sure = c2.checkbox("Yes, these are the same person", key=f"dup_sure_{gi}_{group[0]['id']}")
+            if st.button("Merge into one record", key=f"dup_go_{gi}_{group[0]['id']}", type="primary", disabled=not sure):
+                for r in group:
+                    if r["id"] != keep:
+                        merge_members(keep, r["id"])
+                notify(f"Merged {len(group)} records for {group[0]['full_name']} into one ({fmt_phone(get_member(keep)['phone_number'])}).")
+                st.rerun()
+
+
 def members_tab():
-    t_dir, t_bday, t_link, t_import = st.tabs([":material/groups: Directory", ":material/cake: Birthdays",
-                                               ":material/share: Membership link",
-                                               ":material/upload_file: Import existing members"])
+    dupes = len(possible_duplicates())
+    t_dir, t_dup, t_bday, t_link, t_import = st.tabs([":material/groups: Directory",
+                                                      f":material/join: Possible duplicates{f' ({dupes})' if dupes else ''}",
+                                                      ":material/cake: Birthdays",
+                                                      ":material/share: Membership link",
+                                                      ":material/upload_file: Import existing members"])
+    with t_dup:
+        duplicates_section()
     with t_dir:
         directory_section()
     with t_bday:
@@ -4785,8 +5001,8 @@ def account_section():
         me = get_admin(user["id"])
         if not me or not verify_password(current, me["password_hash"]):
             st.error("Your current password is incorrect.")
-        elif len(new) < 8:
-            st.error("The new password must be at least 8 characters.")
+        elif password_problem(new, me.get("username", "")):
+            st.error(password_problem(new, me.get("username", "")))
         elif new != again:
             st.error("The two new passwords don't match.")
         else:
@@ -4819,8 +5035,8 @@ def team_tab():
                 problems.append("Usernames need 3–30 letters, numbers, dots, dashes or underscores (no spaces).")
             elif username.strip().casefold() == owner_username().casefold():
                 problems.append("That username is reserved for the main administrator.")
-            if len(password) < 8:
-                problems.append("The temporary password must be at least 8 characters.")
+            if password_problem(password, username):
+                problems.append(password_problem(password, username))
             if problems:
                 show_errors(problems)
             else:
@@ -4866,8 +5082,8 @@ def team_tab():
                     with st.form(f"reset_pw_{member['id']}", clear_on_submit=True):
                         temp = st.text_input("New temporary password", type="password")
                         if st.form_submit_button("Reset password", width="stretch"):
-                            if len(temp) < 8:
-                                st.error("At least 8 characters.")
+                            if password_problem(temp, member.get("username", "")):
+                                st.error(password_problem(temp, member.get("username", "")))
                             else:
                                 update_admin(member["id"], password_hash=hash_password(temp))
                                 notify(f"Reset the password for {member['full_name']}.")
@@ -5436,6 +5652,11 @@ def main():
                        initial_sidebar_state="collapsed")
     init_db()
     inject_css(public=not (mode == "admin" and logged_in))
+    if not (mode == "admin" and logged_in):
+        # member-page styles on every public page (join, masterclass, live room, prayer room too).
+        # Two separate blocks: joined on one line, the second <style> would show up as text.
+        st.markdown(_with_heading_font(INFO_CSS), unsafe_allow_html=True)
+        st.markdown(MOTION_CSS, unsafe_allow_html=True)
     if mode == "admin":
         admin_page()
     elif mode == "register":
