@@ -3122,6 +3122,149 @@ a.ig-calbtn {{ min-height:2.75rem; }}
 </style>"""
 
 
+# ---------------------------------------------------------------------------
+# Liquid glass: see-through cards with a bright rim, a soft light that follows
+# the finger or mouse, and glossy buttons. Built from plain CSS so it works in
+# every modern phone browser; older browsers simply get solid white cards.
+# ---------------------------------------------------------------------------
+GLASS_SURFACES = ('[data-testid="stForm"], .ig-ticket, .ig-info, .ig-note, .ig-spot, .ig-glance, '
+                  '[data-testid="stExpander"] details, [data-testid="stMetric"], '
+                  '[class*="st-key-glass"]:not([class*="st-key-glass_panel"]):not(.st-key-glass_topbar)')
+
+
+def _glass_css(admin: bool) -> str:
+    g = GLASS_SURFACES
+    # each selector gets the pseudo-element suffix
+    def each(suffix):
+        return ", ".join(s.strip() + suffix for s in g.split(", ") if s.strip())
+    aurora = (
+        "radial-gradient(70vw 55vh at 6% -8%, rgba(124,77,200,.24), transparent 70%),"
+        "radial-gradient(55vw 50vh at 104% 18%, rgba(201,162,75,.22), transparent 70%),"
+        "radial-gradient(65vw 60vh at 38% 112%, rgba(224,102,42,.12), transparent 70%)")
+    drift = f"""
+.stApp::before {{ content:""; position:fixed; inset:-10vh -10vw; z-index:0; pointer-events:none; background:{aurora};
+    animation:igDrift 38s ease-in-out infinite alternate; }}
+[data-testid="stAppViewContainer"], [data-testid="stMain"], header[data-testid="stHeader"] {{
+    background:transparent !important; position:relative; z-index:1; }}
+@keyframes igDrift {{ from {{ transform:translate3d(-2vw,-1vh,0) scale(1); }} to {{ transform:translate3d(2vw,2vh,0) scale(1.08); }} }}
+/* tab bars become a frosted pill; the open tab sits on a raised glass chip that slides between tabs */
+.stTabs [role="tablist"] {{ gap:0; padding:.25rem; border-radius:16px; width:fit-content; max-width:100%;
+    background:rgba(255,255,255,.5); -webkit-backdrop-filter:blur(16px) saturate(180%); backdrop-filter:blur(16px) saturate(180%);
+    border:1px solid rgba(255,255,255,.7); box-shadow:inset 0 1px 0 rgba(255,255,255,.9), 0 10px 24px -18px rgba(31,26,51,.45); }}
+.stTabs [role="tablist"]::after {{ display:none !important; }}
+.stTabs [data-testid="stTab"] {{ border-radius:12px; padding:.3rem .6rem !important; height:auto !important; min-height:2.4rem;
+    transition:background .2s ease; }}
+@media (hover:hover) and (pointer:fine) {{ .stTabs [data-testid="stTab"]:hover {{ background:rgba(255,255,255,.5); }} }}
+.stTabs [data-testid="stTab"] > [data-testid="stMarkdownContainer"] {{ position:relative; z-index:1; }}
+.stTabs .react-aria-SelectionIndicator {{ inset:0 !important; height:auto !important; width:auto !important; border-radius:12px;
+    background:rgba(255,255,255,.94) !important; z-index:0;
+    box-shadow:inset 0 1px 0 #fff, 0 1px 2px rgba(31,26,51,.08), 0 8px 16px -10px rgba(75,46,131,.5); }}
+""" if admin else ""
+    return f"""<style>
+.stApp {{ --glass-blur: blur(20px) saturate(185%);
+    background:{aurora}, var(--paper) !important; background-attachment:fixed !important; }}
+{drift}
+/* ---- the glass itself ---- */
+{g} {{
+    position:relative; isolation:isolate;
+    background:linear-gradient(160deg, rgba(255,255,255,.74) 0%, rgba(255,255,255,.52) 100%) !important;
+    -webkit-backdrop-filter:var(--glass-blur); backdrop-filter:var(--glass-blur);
+    border:1px solid rgba(255,255,255,.55) !important;
+    box-shadow:inset 0 1px 0 rgba(255,255,255,.95), inset 0 -1px 0 rgba(31,26,51,.05),
+               0 1px 2px rgba(31,26,51,.05), 0 26px 50px -30px rgba(31,26,51,.5) !important; }}
+/* bright rim: light catches the top-left edge and a little gold the bottom-right */
+{each("::before")} {{
+    content:""; position:absolute; inset:0; border-radius:inherit; padding:1px; pointer-events:none; z-index:2;
+    background:linear-gradient(140deg, rgba(255,255,255,.98) 0%, rgba(255,255,255,.25) 30%, rgba(255,255,255,0) 55%, rgba(201,162,75,.5) 100%);
+    -webkit-mask:linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+    -webkit-mask-composite:xor; mask-composite:exclude; }}
+/* soft light that follows the finger or mouse (position set by a tiny script; sits top-left otherwise) */
+{each("::after")} {{
+    content:""; position:absolute; inset:0; border-radius:inherit; pointer-events:none; z-index:1;
+    background:radial-gradient(380px circle at var(--mx, 18%) var(--my, -12%), rgba(255,255,255,.55), rgba(255,255,255,0) 62%);
+    mix-blend-mode:soft-light; opacity:.9; transition:opacity .35s ease; }}
+.ig-spot-date, .ig-ticket-date {{ position:relative; z-index:0; }}
+/* fields on glass stay almost solid so typing is easy to read */
+[data-baseweb="input"], [data-baseweb="select"] > div, [data-baseweb="textarea"] {{ background:rgba(255,255,255,.84) !important; }}
+
+/* ---- the "you're in" card: dark glass ---- */
+.ig-done {{ position:relative; isolation:isolate;
+    background:radial-gradient(120% 90% at 50% 0%, rgba(68,52,124,.92) 0%, rgba(31,26,51,.9) 62%) !important;
+    -webkit-backdrop-filter:blur(22px) saturate(160%); backdrop-filter:blur(22px) saturate(160%);
+    box-shadow:inset 0 1px 0 rgba(255,255,255,.22), 0 30px 60px -30px rgba(31,26,51,.8) !important; }}
+.ig-done::before {{ content:""; position:absolute; inset:0; border-radius:inherit; padding:1px; pointer-events:none;
+    background:linear-gradient(150deg, rgba(255,255,255,.55), rgba(255,255,255,0) 40%, rgba(201,162,75,.6) 100%);
+    -webkit-mask:linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); -webkit-mask-composite:xor; mask-composite:exclude; }}
+
+/* ---- glossy buttons: a lens of light on top, a sheen that sweeps across on hover, a squeeze on press ---- */
+.stApp [data-testid="stBaseButton-primary"], .stApp [data-testid="stBaseButton-primaryFormSubmit"] {{
+    position:relative; overflow:hidden; isolation:isolate;
+    background:linear-gradient(180deg, #7A54CD 0%, #4B2E83 58%, #35205F 100%) !important;
+    box-shadow:inset 0 1px 0 rgba(255,255,255,.42), inset 0 -3px 8px rgba(20,10,40,.35),
+               0 14px 28px -14px rgba(75,46,131,.9) !important; }}
+.stApp [data-testid="stBaseButton-primary"]::before, .stApp [data-testid="stBaseButton-primaryFormSubmit"]::before {{
+    content:""; position:absolute; left:0; right:0; top:0; height:62%; pointer-events:none;
+    background:radial-gradient(120% 100% at 50% 0%, rgba(255,255,255,.22), rgba(255,255,255,0) 70%); }}
+.stApp [data-testid="stBaseButton-primary"]::after, .stApp [data-testid="stBaseButton-primaryFormSubmit"]::after {{
+    content:""; position:absolute; inset:0; pointer-events:none; transform:translateX(-130%);
+    background:linear-gradient(105deg, transparent 35%, rgba(255,255,255,.32) 50%, transparent 65%);
+    transition:transform .75s cubic-bezier(.23,1,.32,1); }}
+@media (hover:hover) and (pointer:fine) {{
+  .stApp [data-testid="stBaseButton-primary"]:hover::after, .stApp [data-testid="stBaseButton-primaryFormSubmit"]:hover::after {{ transform:translateX(130%); }} }}
+.stApp [data-testid="stBaseButton-primary"] > *, .stApp [data-testid="stBaseButton-primaryFormSubmit"] > * {{ position:relative; z-index:1; }}
+.stApp [data-testid="stBaseButton-secondary"], .stApp [data-testid="stBaseButton-secondaryFormSubmit"],
+.stApp div.stDownloadButton > button, .stApp div.stLinkButton > a {{
+    background:rgba(255,255,255,.62) !important; -webkit-backdrop-filter:blur(14px) saturate(170%); backdrop-filter:blur(14px) saturate(170%);
+    border:1px solid rgba(255,255,255,.75) !important;
+    box-shadow:inset 0 1px 0 rgba(255,255,255,.95), 0 8px 18px -14px rgba(31,26,51,.45) !important; }}
+a.ig-calbtn {{ position:relative; overflow:hidden; box-shadow:inset 0 1px 0 rgba(255,255,255,.42), inset 0 -3px 8px rgba(20,10,40,.3),
+    0 14px 28px -14px rgba(75,46,131,.85) !important; }}
+/* the green "Saved" button keeps its colour */
+.stApp [class*="st-key-igsaved_"] [data-testid="stBaseButton-primaryFormSubmit"] {{
+    background:linear-gradient(180deg, #2E9A5E 0%, #1E7B47 60%, #17643A 100%) !important; }}
+
+/* ---- when glass can't be drawn, or the person asked for less see-through UI: solid cards ---- */
+@supports not ((backdrop-filter:blur(1px)) or (-webkit-backdrop-filter:blur(1px))) {{
+  {g} {{ background:#fff !important; }} }}
+@media (prefers-reduced-transparency: reduce) {{
+  {g} {{ background:#fff !important; -webkit-backdrop-filter:none; backdrop-filter:none; }} }}
+@media (prefers-reduced-motion: reduce) {{
+  .stApp::before {{ animation:none !important; }}
+  .stApp [data-testid="stBaseButton-primary"]::after, .stApp [data-testid="stBaseButton-primaryFormSubmit"]::after {{ display:none; }} }}
+[class*="st-key-ig_glass_light"] {{ position:absolute !important; width:0; height:0; overflow:hidden; }}
+</style>"""
+
+
+GLASS_LIGHT_JS = """<script>
+(function () {
+  var w = window.parent, d = w.document;
+  if (w.__igGlassLight) return; w.__igGlassLight = true;
+  if (w.matchMedia && w.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  var SEL = %s, last = null, queued = null;
+  function paint() {
+    var e = queued; queued = null; if (!e) return;
+    var el = e.target && e.target.closest ? e.target.closest(SEL) : null;
+    if (last && last !== el) { last.style.removeProperty('--mx'); last.style.removeProperty('--my'); }
+    if (el) { var r = el.getBoundingClientRect();
+      el.style.setProperty('--mx', (e.clientX - r.left) + 'px'); el.style.setProperty('--my', (e.clientY - r.top) + 'px'); }
+    last = el;
+  }
+  function on(e) { if (!queued) w.requestAnimationFrame(paint); queued = e; }
+  d.addEventListener('pointermove', on, { passive: true });
+  d.addEventListener('pointerdown', on, { passive: true });
+})();
+</script>""" % json.dumps(GLASS_SURFACES)
+
+
+def glass_layer(admin: bool):
+    st.markdown(_glass_css(admin), unsafe_allow_html=True)
+    with st.container(key="ig_glass_light_a" if admin else "ig_glass_light_p"):
+        if hasattr(st, "iframe"):
+            st.iframe(GLASS_LIGHT_JS, height=1)
+        else:
+            st.components.v1.html(GLASS_LIGHT_JS, height=0)
+
+
 def page_top():
     """Flyer slot at the very top, then the brand. Returns the flyer slot."""
     banner = st.container(key="flyer_banner")
@@ -5575,6 +5718,7 @@ def admin_page():
         admin_login()
         return
     user = current_admin()
+    glass_layer(admin=True)
     bar = st.container(key="glass_topbar")
     c1, c2 = bar.columns([4, 1], vertical_alignment="center")
     with c1:
@@ -5657,6 +5801,8 @@ def main():
         # Two separate blocks: joined on one line, the second <style> would show up as text.
         st.markdown(_with_heading_font(INFO_CSS), unsafe_allow_html=True)
         st.markdown(MOTION_CSS, unsafe_allow_html=True)
+    if not (mode == "admin" and logged_in):
+        glass_layer(admin=False)
     if mode == "admin":
         admin_page()
     elif mode == "register":
