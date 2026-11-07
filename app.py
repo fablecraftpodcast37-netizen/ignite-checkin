@@ -340,6 +340,18 @@ CREATE INDEX IF NOT EXISTS idx_attendance_member ON attendance(member_id);
 CREATE INDEX IF NOT EXISTS idx_prereg_event      ON pre_registrations(event_id);
 CREATE INDEX IF NOT EXISTS idx_prereg_member     ON pre_registrations(member_id);
 
+-- Check-ins that were made before the programme's day (through the arrival link) are
+-- moved to pre-registrations. The original rows are kept here, untouched.
+CREATE TABLE IF NOT EXISTS early_checkins_moved (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    attendance_id       INTEGER NOT NULL,
+    member_id           INTEGER NOT NULL,
+    event_id            INTEGER NOT NULL,
+    check_in_timestamp  DATETIME,
+    invited_by          TEXT,
+    moved_at            DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 -- Arrival times can't be edited.
 CREATE TRIGGER IF NOT EXISTS attendance_no_update
 BEFORE UPDATE ON attendance
@@ -444,6 +456,23 @@ def _allow_pa_role(conn: sqlite3.Connection):
     conn.execute("DROP TABLE admins_old")
 
 
+def _move_early_checkins(conn: sqlite3.Connection):
+    """A check-in recorded before the programme's date can't be a real arrival: the person
+    used the arrival link to sign up. Turn each one into a pre-registration (keeping the
+    original time and who invited them) and keep a copy of the original row. Nothing is lost."""
+    rows = conn.execute("""SELECT a.id, a.member_id, a.event_id, a.check_in_timestamp, a.invited_by
+                            FROM attendance a JOIN events e ON e.id = a.event_id
+                            WHERE COALESCE(e.event_date, '') <> ''
+                              AND date(a.check_in_timestamp) < date(e.event_date)""").fetchall()
+    for r in rows:
+        conn.execute("""INSERT INTO early_checkins_moved (attendance_id, member_id, event_id, check_in_timestamp, invited_by)
+                        VALUES (?, ?, ?, ?, ?)""", (r["id"], r["member_id"], r["event_id"], r["check_in_timestamp"], r["invited_by"]))
+        conn.execute("""INSERT OR IGNORE INTO pre_registrations (member_id, event_id, registered_at, invited_by)
+                        VALUES (?, ?, ?, ?)""", (r["member_id"], r["event_id"], r["check_in_timestamp"], r["invited_by"]))
+        conn.execute("DELETE FROM attendance WHERE id = ?", (r["id"],))
+    return len(rows)
+
+
 def migrate(conn: sqlite3.Connection):
     """Add missing columns, create missing tables, and run one-off data
     upgrades. Existing records are never removed."""
@@ -456,6 +485,7 @@ def migrate(conn: sqlite3.Connection):
             if column not in cols:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
     conn.executescript(SCHEMA)
+    _move_early_checkins(conn)
     done = conn.execute("SELECT value FROM settings WHERE key = 'data_version'").fetchone()
     if not done or done["value"] != DATA_VERSION:
         _upgrade_phone_numbers(conn)
@@ -3371,6 +3401,9 @@ def resolve_checkin_event():
 
 
 def complete_checkin(member_id: int, ev: dict, is_new: bool, invited_by=None):
+    if checkin_opens_later(ev):
+        complete_prereg(member_id, ev, invited_by)
+        return
     context = ev["event_name"]
     if record_check_in(member_id, ev["id"], invited_by):
         if is_new:
@@ -3393,6 +3426,10 @@ def checkin_page():
     banner = page_top()
     ev = resolve_checkin_event()
     if ev is None:
+        return
+    if checkin_opens_later(ev) and ev.get("uses_checkin", 1):
+        # The arrival link was shared early: until the day it takes registrations, not check-ins.
+        register_flow(ev, banner, from_arrival_link=True)
         return
     show_flyer(banner, ev)
     if not ev.get("uses_checkin", 1):
@@ -3471,13 +3508,33 @@ def register_page():
         page_heading("Registration", "This link isn't valid",
                      "Please ask the organisers for the correct registration link.")
         return
+    register_flow(ev, banner)
+
+
+def checkin_opens_later(ev: dict) -> bool:
+    """True before the programme's day (Ghana time). Check-in only opens on the day itself."""
+    try:
+        return date.fromisoformat(str(ev.get("event_date") or "")[:10]) > datetime.now(timezone.utc).date()  # Ghana is GMT all year
+    except ValueError:
+        return False
+
+
+def register_flow(ev: dict, banner, from_arrival_link: bool = False):
     show_flyer(banner, ev)
-    page_heading("Pre-registration", "Reserve your place", "Let us know you're coming so we can prepare for you.")
+    if from_arrival_link:
+        page_heading("Registration", "Reserve your place",
+                     f"Check-in opens on the day ({fmt_date(ev['event_date'])}). For now, let us know you're coming.")
+    else:
+        page_heading("Pre-registration", "Reserve your place", "Let us know you're coming so we can prepare for you.")
     event_ticket(ev)
     event_info_card(ev)
     if not ev["prereg_open"]:
-        st.markdown('<div class="ig-note">This programme doesn\'t need pre-registration. Just come along on the day '
-                    'and scan the QR code at the entrance to check in.</div>', unsafe_allow_html=True)
+        if from_arrival_link:
+            st.markdown(f'<div class="ig-note"><strong>Check-in opens on {esc(fmt_date(ev["event_date"]))}.</strong> '
+                        'On the day, open this same link at the entrance to check in.</div>', unsafe_allow_html=True)
+        else:
+            st.markdown('<div class="ig-note">This programme doesn\'t need pre-registration. Just come along on the day '
+                        'and scan the QR code at the entrance to check in.</div>', unsafe_allow_html=True)
         return
     if prereg_deadline_passed(ev):
         prereg_closed_note(ev)
@@ -3505,8 +3562,10 @@ def register_page():
         if member_id:
             complete_prereg(member_id, ev, pending.get("invited_by"))
     if ev.get("uses_checkin", 1):
+        how = ("open this same link at the entrance" if from_arrival_link
+               else "scan the QR code at the entrance")
         st.markdown('<div class="ig-note">This reserves your place. It isn\'t your check-in: on the day, '
-                    'scan the QR code at the entrance to confirm you\'ve arrived.</div>', unsafe_allow_html=True)
+                    f'{how} to confirm you\'ve arrived.</div>', unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------------------
