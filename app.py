@@ -4870,6 +4870,25 @@ def followup_section(events: list[dict]):
         st.success("Everyone in the chosen groups has already registered. Nobody to call.", icon=":material/check_circle:")
         return
 
+    # The list on its own, as a clean Excel sheet: just the people who haven't registered yet.
+    sheet = df[["Full Name", "Phone", "Gender", "On list from", "Last came"]].copy()
+    sheet.insert(0, "No.", range(1, len(sheet) + 1))
+    sheet["Call outcome"] = df["Outcome"].where(df["Outcome"] != "Not called yet", "")
+    sheet["Notes"] = df["Note"]
+    with st.container(key="fu_excel"):
+        st.markdown("""<style>.st-key-fu_excel div.stDownloadButton > button {
+            background:linear-gradient(180deg,#7A54CD 0%,#4B2E83 58%,#35205F 100%) !important; color:#fff !important;
+            border:none !important; min-height:3rem; font-weight:600; }
+            .st-key-fu_excel div.stDownloadButton > button * { color:#fff !important; }</style>""",
+                    unsafe_allow_html=True)
+        st.download_button(
+            f"Download Excel: {len(df)} not yet registered for {target['event_name']}",
+            to_excel_bytes(sheet, "Not yet registered"),
+            file_name=f"Not_yet_registered_{safe_filename(target['event_name'])}_{datetime.now(timezone.utc):%Y-%m-%d}.xlsx",
+            mime=XLSX_MIME, type="primary", width="stretch", icon=":material/download:", key=f"fu_excel_{target['id']}")
+        st.caption("Only the people above who haven't registered yet, numbered, with space for call notes. "
+                   "Change the groups above to change who is in the file.")
+
     base = current_base_url()
     link = register_link(base, target["id"]) if base else ""
     with st.expander(":material/chat: WhatsApp message", expanded=False):
