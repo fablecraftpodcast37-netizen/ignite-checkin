@@ -352,6 +352,18 @@ CREATE TABLE IF NOT EXISTS early_checkins_moved (
     moved_at            DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Follow-up calls: how each call went, per person and programme.
+CREATE TABLE IF NOT EXISTS follow_ups (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    member_id   INTEGER NOT NULL REFERENCES members(id),
+    event_id    INTEGER NOT NULL REFERENCES events(id),
+    outcome     TEXT NOT NULL DEFAULT 'Not called yet',
+    note        TEXT,
+    updated_by  TEXT,
+    updated_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (member_id, event_id)
+);
+
 -- Arrival times can't be edited.
 CREATE TRIGGER IF NOT EXISTS attendance_no_update
 BEFORE UPDATE ON attendance
@@ -1292,6 +1304,7 @@ def delete_member(member_id: int) -> int:
     with closing(get_conn()) as conn, conn:
         removed = conn.execute("DELETE FROM attendance WHERE member_id = ?", (member_id,)).rowcount
         removed += conn.execute("DELETE FROM pre_registrations WHERE member_id = ?", (member_id,)).rowcount
+        conn.execute("DELETE FROM follow_ups WHERE member_id = ?", (member_id,))
         conn.execute("DELETE FROM members WHERE id = ?", (member_id,))
     return removed
 
@@ -4726,11 +4739,209 @@ def events_tab():
 # ---------------------------------------------------------------------------
 # Admin: pre-registrations and check-ins
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Admin: follow-up calls. People from an earlier list (an earlier programme, or the
+# members imported/added by admin) who haven't registered for the coming programme yet.
+# Each call's outcome and note are saved, so the team never calls the same person twice.
+# ---------------------------------------------------------------------------
+FOLLOWUP_OUTCOMES = ["Not called yet", "No answer", "Call back later", "Will come", "Maybe",
+                     "Not coming", "Wrong number"]
+FU_IMPORTED = "imported"
+FU_EVERYONE = "everyone"
+DEFAULT_FOLLOWUP_MESSAGE = ("Hello {name}, greetings from Ignite Prayer Network. We'd love to have you with us at "
+                            "{event} on {date}. Kindly reserve your place here: {link} God bless you.")
+
+
+def next_event(events: list[dict]):
+    """The soonest programme from today on; failing that, the most recent one."""
+    today = datetime.now(timezone.utc).date().isoformat()
+    coming = sorted((e for e in events if (e.get("event_date") or "") >= today), key=lambda e: e["event_date"])
+    return coming[0] if coming else (events[0] if events else None)
+
+
+def followup_sources(events: list[dict], target_id: int) -> dict:
+    opts = {FU_IMPORTED: "Imported or added by admin (e.g. the Achimota Forest list)"}
+    for e in events:
+        if e["id"] != target_id:
+            opts[f"came:{e['id']}"] = f"Came to {public_label(e)}"
+            opts[f"reg:{e['id']}"] = f"Registered for {public_label(e)}"
+    opts[FU_EVERYONE] = "Everyone on the member list"
+    return opts
+
+
+def get_followup_list(target_id: int, sources: list[str]) -> pd.DataFrame:
+    """Members in any of the chosen groups who are neither registered nor checked in for
+    the target programme, with the latest call outcome for that programme."""
+    parts, params, labels = [], [], []
+    for key in sources:
+        if key == FU_EVERYONE:
+            parts.append("SELECT id AS member_id, 'Member list' AS src FROM members")
+        elif key == FU_IMPORTED:
+            parts.append("SELECT id AS member_id, 'Imported / added by admin' AS src FROM members "
+                         "WHERE source IN ('Imported', 'Added by admin')")
+        elif key.startswith(("came:", "reg:")):
+            kind, _, eid = key.partition(":")
+            if not eid.isdigit():
+                continue
+            table = "attendance" if kind == "came" else "pre_registrations"
+            name = (get_event(int(eid)) or {}).get("event_name", "earlier programme")
+            parts.append(f"SELECT member_id, ? AS src FROM {table} WHERE event_id = ?")
+            params += [("Came to " if kind == "came" else "Registered for ") + name, int(eid)]
+    if not parts:
+        return pd.DataFrame()
+    sql = f"""
+        WITH pool AS ({' UNION ALL '.join(parts)}),
+        grouped AS (SELECT member_id, group_concat(DISTINCT src) AS srcs FROM pool GROUP BY member_id)
+        SELECT m.id AS member_id, m.full_name AS "Full Name", m.phone_number AS "Phone",
+               COALESCE(m.gender, '') AS "Gender", g.srcs AS "On list from",
+               COALESCE((SELECT strftime('%Y-%m-%d', MAX(a.check_in_timestamp)) FROM attendance a
+                         WHERE a.member_id = m.id), '') AS "Last came",
+               COALESCE(f.outcome, 'Not called yet') AS "Outcome", COALESCE(f.note, '') AS "Note",
+               COALESCE(f.updated_by, '') AS "Called by",
+               COALESCE(strftime('%Y-%m-%d %H:%M', f.updated_at), '') AS "Updated"
+        FROM grouped g JOIN members m ON m.id = g.member_id
+        LEFT JOIN follow_ups f ON f.member_id = m.id AND f.event_id = ?
+        WHERE m.id NOT IN (SELECT member_id FROM pre_registrations WHERE event_id = ?)
+          AND m.id NOT IN (SELECT member_id FROM attendance WHERE event_id = ?)
+        ORDER BY m.full_name COLLATE NOCASE"""
+    return query_df(sql, params + [target_id, target_id, target_id])
+
+
+def followup_wins(target_id: int) -> int:
+    """People who were called for this programme and have since registered or arrived."""
+    with closing(get_conn()) as conn:
+        return conn.execute(
+            """SELECT COUNT(*) FROM follow_ups f
+               WHERE f.event_id = ? AND f.outcome <> 'Not called yet'
+                 AND (f.member_id IN (SELECT member_id FROM pre_registrations WHERE event_id = ?)
+                      OR f.member_id IN (SELECT member_id FROM attendance WHERE event_id = ?))""",
+            (target_id, target_id, target_id)).fetchone()[0]
+
+
+def save_followups(target_id: int, changes: list[dict], who: str) -> int:
+    with closing(get_conn()) as conn, conn:
+        for c in changes:
+            outcome = c["Outcome"] if c["Outcome"] in FOLLOWUP_OUTCOMES else "Not called yet"
+            conn.execute(
+                """INSERT INTO follow_ups (member_id, event_id, outcome, note, updated_by, updated_at)
+                   VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                   ON CONFLICT (member_id, event_id) DO UPDATE SET outcome = excluded.outcome,
+                       note = excluded.note, updated_by = excluded.updated_by, updated_at = CURRENT_TIMESTAMP""",
+                (int(c["member_id"]), target_id, outcome, clean_text(c.get("Note"), 300), who[:60]))
+    return len(changes)
+
+
+def followup_message(template: str, name: str, ev: dict, link: str) -> str:
+    text = template or DEFAULT_FOLLOWUP_MESSAGE
+    for key, val in (("{name}", first_name(name) or "there"), ("{event}", ev["event_name"]),
+                     ("{date}", fmt_date(ev.get("event_date")) or "the day"), ("{link}", link)):
+        text = text.replace(key, val)
+    return text
+
+
+def followup_section(events: list[dict]):
+    st.markdown("Find people from an earlier list who **haven't registered yet** for a coming programme, "
+                "then call or WhatsApp them and note how it went. Anyone who registers drops off the list by "
+                "themselves.")
+    target_default = next_event(events)
+    ids = [e["id"] for e in events]
+    by_id = {e["id"]: e for e in events}
+    if st.session_state.get("fu_target") not in ids:
+        st.session_state["fu_target"] = target_default["id"]
+    target = by_id[st.selectbox("Programme they should register for", ids, key="fu_target",
+                                format_func=lambda i: event_label(by_id[i]))]
+    opts = followup_sources(events, target["id"])
+    st.session_state["fu_sources"] = [k for k in st.session_state.get("fu_sources", [FU_IMPORTED]) if k in opts]
+    sources = st.multiselect("Who should be on the call list?", list(opts), key="fu_sources",
+                             format_func=lambda k: opts[k],
+                             help="Pick one or more groups. Someone in two groups appears once.")
+    if not sources:
+        st.info("Choose at least one group above.", icon=":material/info:")
+        return
+    df = get_followup_list(target["id"], sources)
+    called = int((df["Outcome"] != "Not called yet").sum()) if not df.empty else 0
+    c = st.columns(4)
+    c[0].metric("Still to register", len(df))
+    c[1].metric("Called so far", called)
+    c[2].metric("Said they'll come", int((df["Outcome"] == "Will come").sum()) if not df.empty else 0)
+    c[3].metric("Registered after a call", followup_wins(target["id"]),
+                help="People the team called who have since registered or checked in. They're no longer on this list.")
+    if df.empty:
+        st.success("Everyone in the chosen groups has already registered. Nobody to call.", icon=":material/check_circle:")
+        return
+
+    base = current_base_url()
+    link = register_link(base, target["id"]) if base else ""
+    with st.expander(":material/chat: WhatsApp message", expanded=False):
+        st.caption("Each WhatsApp button opens a chat with this message filled in. {name}, {event}, {date} and "
+                   "{link} are swapped for the person's first name and the programme's details.")
+        template = st.text_area("Message", value=st.session_state.get("fu_msg", DEFAULT_FOLLOWUP_MESSAGE),
+                                key="fu_msg", height=110, max_chars=600)
+        if not link:
+            st.warning("Set the app address under Events so the message can include the registration link.")
+    template = st.session_state.get("fu_msg", DEFAULT_FOLLOWUP_MESSAGE)
+
+    f1, f2, f3 = st.columns([2, 2, 1])
+    search = f1.text_input("Search by name or phone", key="fu_search")
+    show = f2.multiselect("Show only", FOLLOWUP_OUTCOMES, key="fu_show", placeholder="All outcomes")
+    callers = int(f3.number_input("Callers", 1, 20, 1, key="fu_callers",
+                                  help="Split the list evenly between this many people."))
+    view = filter_people(df, search)
+    if show:
+        view = view[view["Outcome"].isin(show)]
+    view = view.reset_index(drop=True)
+    if callers > 1:
+        view.insert(0, "Caller", [f"Caller {i % callers + 1}" for i in range(len(view))])
+        mine = st.radio("List for", ["Everyone"] + [f"Caller {i}" for i in range(1, callers + 1)],
+                        horizontal=True, key="fu_mine")
+        if mine != "Everyone":
+            view = view[view["Caller"] == mine].reset_index(drop=True)
+
+    view.insert(1 if callers > 1 else 0, "Call", ["tel:" + str(p) for p in view["Phone"]])
+    view.insert(2 if callers > 1 else 1, "WhatsApp",
+                [member_whatsapp_url(p, followup_message(template, n, target, link))
+                 for p, n in zip(view["Phone"], view["Full Name"])])
+    shown = view.drop(columns=["member_id"])
+    with st.form(f"fu_form_{target['id']}"):
+        edited = st.data_editor(
+            shown, hide_index=True, width="stretch", height=min(560, 38 + 35 * len(shown)), key=f"fu_editor_{target['id']}",
+            disabled=[c for c in shown.columns if c not in ("Outcome", "Note")],
+            column_config={
+                "Call": st.column_config.LinkColumn("Call", display_text="Call", width="small"),
+                "WhatsApp": st.column_config.LinkColumn("WhatsApp", display_text="Message", width="small"),
+                "Outcome": st.column_config.SelectboxColumn("Outcome", options=FOLLOWUP_OUTCOMES, required=True),
+                "Note": st.column_config.TextColumn("Note", max_chars=300),
+            })
+        pressed = save_submit("Save call notes", f"fu_save_{target['id']}", type="primary")
+    if pressed:
+        before = view[["member_id", "Outcome", "Note"]].reset_index(drop=True)
+        after = edited[["Outcome", "Note"]].reset_index(drop=True)
+        changes = [{"member_id": before.at[i, "member_id"], "Outcome": after.at[i, "Outcome"], "Note": after.at[i, "Note"]}
+                   for i in range(len(before))
+                   if (after.at[i, "Outcome"], str(after.at[i, "Note"] or "")) != (before.at[i, "Outcome"], before.at[i, "Note"])]
+        if changes:
+            n = save_followups(target["id"], changes, current_admin().get("name", "admin"))
+            notify(f"Saved {n} call note{'s' if n != 1 else ''}.")
+        else:
+            notify("Nothing changed.")
+        st.rerun()
+    export = shown.drop(columns=["Call", "WhatsApp"])
+    download_pair(export, f"{safe_filename(target['event_name'])}_follow_up_calls", "Follow-up calls", f"fu_{target['id']}")
+
+
 def prereg_tab():
     events = get_events()
     if not events:
         st.info("No events yet.")
         return
+    sub = st.tabs([":material/how_to_reg: Registered", ":material/call: Follow-up calls"])
+    with sub[0]:
+        prereg_list_section(events)
+    with sub[1]:
+        followup_section(events)
+
+
+def prereg_list_section(events: list[dict]):
     ev = event_picker("Event", "prereg_event", events)
     df = get_prereg_ledger(ev["id"])
     if not ev["prereg_open"] and df.empty:
@@ -5126,6 +5337,8 @@ def merge_members(keep_id: int, drop_id: int) -> dict:
         cur = conn.execute("UPDATE OR IGNORE pre_registrations SET member_id = ? WHERE member_id = ?", (keep_id, drop_id))
         moved["pre_registrations"] = cur.rowcount
         conn.execute("DELETE FROM pre_registrations WHERE member_id = ?", (drop_id,))   # same event twice: keep one
+        conn.execute("UPDATE OR IGNORE follow_ups SET member_id = ? WHERE member_id = ?", (keep_id, drop_id))
+        conn.execute("DELETE FROM follow_ups WHERE member_id = ?", (drop_id,))
         sets = ", ".join(f"{c} = COALESCE(NULLIF({c}, ''), (SELECT {c} FROM members WHERE id = :drop))" for c in MERGE_FILL)
         conn.execute(f"UPDATE members SET {sets} WHERE id = :keep", {"keep": keep_id, "drop": drop_id})
         conn.execute("DELETE FROM members WHERE id = ?", (drop_id,))
