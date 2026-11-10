@@ -1,8 +1,24 @@
 [theme]
-primaryColor = "#E50914"
-backgroundColor = "#0B0D13"
-secondaryBackgroundColor = "#161922"
-textColor = "#FFFFFF"
+base = "light"
+primaryColor = "#4B2E83"
+backgroundColor = "#FBF8F3"
+secondaryBackgroundColor = "#F3EEE6"
+textColor = "#1F1A33"
 font = "sans serif"
-buttonRadius = "8px"
 
+[server]
+headless = true
+maxUploadSize = 50                # MB: flyers, member lists, Meet reports, backups
+enableXsrfProtection = true       # uploads must come from the app's own pages
+enableCORS = true                 # other websites can't call the app from a browser
+enableStaticServing = false       # no folder of files is published
+fileWatcherType = "none"          # production: don't watch for code changes
+runOnSave = false
+
+[client]
+showErrorDetails = "none"         # visitors never see code or error details (they go to the Render log)
+showErrorLinks = false
+toolbarMode = "minimal"           # no developer menu for visitors
+
+[browser]
+gatherUsageStats = false
