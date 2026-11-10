@@ -4801,10 +4801,18 @@ def get_followup_list(target_id: int, sources: list[str]) -> pd.DataFrame:
                COALESCE(strftime('%Y-%m-%d %H:%M', f.updated_at), '') AS "Updated"
         FROM grouped g JOIN members m ON m.id = g.member_id
         LEFT JOIN follow_ups f ON f.member_id = m.id AND f.event_id = ?
-        WHERE m.id NOT IN (SELECT member_id FROM pre_registrations WHERE event_id = ?)
-          AND m.id NOT IN (SELECT member_id FROM attendance WHERE event_id = ?)
+        WHERE m.id NOT IN (SELECT id FROM done)
+          -- also catch people who registered again under a second record (new number format, retyped name)
+          AND (length(m.phone_number) < 9 OR substr(m.phone_number, -9) NOT IN
+               (SELECT substr(phone_number, -9) FROM done WHERE length(phone_number) >= 9
+                UNION SELECT substr(whatsapp_number, -9) FROM done WHERE length(whatsapp_number) >= 9))
+          AND lower(trim(m.full_name)) NOT IN (SELECT lower(trim(full_name)) FROM done)
         ORDER BY m.full_name COLLATE NOCASE"""
-    return query_df(sql, params + [target_id, target_id, target_id])
+    done = """done AS (SELECT id, phone_number, whatsapp_number, full_name FROM members WHERE id IN
+                 (SELECT member_id FROM pre_registrations WHERE event_id = ?
+                  UNION SELECT member_id FROM attendance WHERE event_id = ?))"""
+    sql = sql.replace("WITH pool AS", "WITH " + done + ",\n        pool AS", 1)
+    return query_df(sql, [target_id, target_id] + params + [target_id])
 
 
 def followup_wins(target_id: int) -> int:
