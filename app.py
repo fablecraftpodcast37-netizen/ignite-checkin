@@ -4806,13 +4806,52 @@ def get_followup_list(target_id: int, sources: list[str]) -> pd.DataFrame:
           AND (length(m.phone_number) < 9 OR substr(m.phone_number, -9) NOT IN
                (SELECT substr(phone_number, -9) FROM done WHERE length(phone_number) >= 9
                 UNION SELECT substr(whatsapp_number, -9) FROM done WHERE length(whatsapp_number) >= 9))
-          AND lower(trim(m.full_name)) NOT IN (SELECT lower(trim(full_name)) FROM done)
         ORDER BY m.full_name COLLATE NOCASE"""
     done = """done AS (SELECT id, phone_number, whatsapp_number, full_name FROM members WHERE id IN
                  (SELECT member_id FROM pre_registrations WHERE event_id = ?
                   UNION SELECT member_id FROM attendance WHERE event_id = ?))"""
     sql = sql.replace("WITH pool AS", "WITH " + done + ",\n        pool AS", 1)
-    return query_df(sql, [target_id, target_id] + params + [target_id])
+    df = query_df(sql, [target_id, target_id] + params + [target_id])
+    df.attrs["name_matches"] = pd.DataFrame()
+    if df.empty:
+        return df
+    # People often register twice with the name written differently ("Daniel Pappoe" for one
+    # programme, "Daniel Allotey Pappoe" for the next) and sometimes a new number. Treat them as
+    # the same person when first name and surname agree, or one full name sits inside the other.
+    done_people = query_df(
+        """SELECT full_name, phone_number FROM members WHERE id IN
+           (SELECT member_id FROM pre_registrations WHERE event_id = ?
+            UNION SELECT member_id FROM attendance WHERE event_id = ?)""", [target_id, target_id])
+    index: dict[frozenset, list] = {}
+    for name, phone in done_people.itertuples(index=False):
+        t = name_tokens(name)
+        if len(t) >= 2:
+            index.setdefault(frozenset((t[0], t[-1])), []).append((name, phone, set(t)))
+    keep, matched = [], []
+    for row in df.itertuples(index=False):
+        t = name_tokens(row[1])
+        hit = None
+        if len(t) >= 2:
+            hit = next(iter(index.get(frozenset((t[0], t[-1])), [])), None)
+            if hit is None:
+                ts = set(t)
+                hit = next((h for hs in index.values() for h in hs
+                            if ts <= h[2] or h[2] <= ts), None)
+        keep.append(hit is None)
+        if hit:
+            matched.append({"On the list as": row[1], "Phone": row[2],
+                            "Registered as": hit[0], "Registered phone": hit[1]})
+    out = df[keep].reset_index(drop=True)
+    out.attrs["name_matches"] = pd.DataFrame(matched)
+    return out
+
+
+def name_tokens(name) -> list[str]:
+    """Lower-case name parts, ignoring punctuation and titles, so 'Bro. Daniel  ALLOTEY-Pappoe'
+    and 'daniel allotey pappoe' compare equal."""
+    titles = {"mr", "mrs", "ms", "miss", "dr", "rev", "pastor", "ps", "bro", "sis", "prof", "eld", "elder", "apostle", "deacon"}
+    words = re.sub(r"[^a-z\s]", " ", str(name or "").lower()).split()
+    return [w for w in words if len(w) > 1 and w not in titles]
 
 
 def followup_wins(target_id: int) -> int:
@@ -4877,6 +4916,13 @@ def followup_section(events: list[dict]):
     if df.empty:
         st.success("Everyone in the chosen groups has already registered. Nobody to call.", icon=":material/check_circle:")
         return
+
+    nm = df.attrs.get("name_matches")
+    if nm is not None and not nm.empty:
+        with st.expander(f"{len(nm)} taken off the list because they registered under a slightly different name or number"):
+            st.caption("Same first name and surname, or one name contains the other (for example "
+                       "'Daniel Pappoe' and 'Daniel Allotey Pappoe'). Check these at a glance.")
+            st.dataframe(nm, hide_index=True, width="stretch")
 
     # The list on its own, as a clean Excel sheet: just the people who haven't registered yet.
     sheet = df[["Full Name", "Phone", "Gender", "On list from", "Last came"]].copy()
