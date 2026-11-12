@@ -3445,6 +3445,17 @@ def whatsapp_community_link():
 # ---------------------------------------------------------------------------
 # Public page: arrival check-in
 # ---------------------------------------------------------------------------
+def next_registration_event():
+    """The soonest programme still taking registrations, so the plain link (no event number)
+    shows its registration form instead of "No programme is open"."""
+    today = today_local().isoformat()
+    for ev in sorted(get_events(), key=lambda e: e.get("event_date") or "9999"):
+        if ((ev.get("event_date") or "") >= today and ev.get("prereg_open")
+                and not prereg_deadline_passed(ev)):
+            return ev
+    return None
+
+
 def resolve_checkin_event():
     raw = st.query_params.get("event")
     if raw and str(raw).isdigit():
@@ -3454,6 +3465,9 @@ def resolve_checkin_event():
         st.warning("That check-in link is no longer valid. Please choose your programme below.")
     events = get_events(open_only=True)
     if not events:
+        upcoming = next_registration_event()
+        if upcoming:
+            return upcoming
         page_heading("Check-in", "No programme is open right now",
                      "Check-in opens shortly before each programme. Please check back soon.")
         return None
@@ -3491,7 +3505,8 @@ def checkin_page():
     ev = resolve_checkin_event()
     if ev is None:
         return
-    if checkin_opens_later(ev) and ev.get("uses_checkin", 1):
+    if (checkin_opens_later(ev) and ev.get("uses_checkin", 1)) or (
+            "event" not in st.query_params and not (ev.get("is_open") and ev.get("uses_checkin", 1))):
         # The arrival link was shared early: until the day it takes registrations, not check-ins.
         register_flow(ev, banner, from_arrival_link=True)
         return
