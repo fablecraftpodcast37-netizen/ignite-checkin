@@ -4345,6 +4345,72 @@ def glance_html(items) -> str:
     return f'<div class="ig-glance">{cells}</div>'
 
 
+def registration_pulse_panel(ev: dict):
+    """Day-by-day registrations for the next event, and a warning when nobody has registered for a
+    while, so a broken link or a quiet group chat is spotted in a day, not a week."""
+    if not ev.get("prereg_open"):
+        return
+    eid = int(ev["id"])
+    stats = query_df(
+        """SELECT COUNT(*) AS total,
+                  SUM(date(registered_at) = date('now')) AS today,
+                  SUM(registered_at >= datetime('now', '-7 days')) AS week,
+                  MAX(registered_at) AS last_at
+           FROM pre_registrations WHERE event_id = ?""", (eid,)).iloc[0]
+    total, today_n = int(stats["total"] or 0), int(stats["today"] or 0)
+    week_n, last_at = int(stats["week"] or 0), stats["last_at"]
+    daily = query_df(
+        """SELECT date(registered_at) AS day, COUNT(*) AS n FROM pre_registrations
+           WHERE event_id = ? AND registered_at >= date('now', '-13 days') GROUP BY day""", (eid,))
+    days = pd.date_range(end=pd.Timestamp(datetime.now(timezone.utc).date()), periods=14, freq="D")
+    counts = dict(zip(daily["day"], daily["n"])) if not daily.empty else {}
+    chart = pd.DataFrame({"Day": [d.strftime("%a %d %b") for d in days],
+                          "Registrations": [int(counts.get(d.strftime("%Y-%m-%d"), 0)) for d in days]})
+
+    st.markdown("#### Registration pulse")
+    hours = None
+    if last_at:
+        try:
+            last = datetime.fromisoformat(str(last_at)).replace(tzinfo=timezone.utc)
+            hours = (datetime.now(timezone.utc) - last).total_seconds() / 3600
+        except ValueError:
+            hours = None
+    closed = prereg_deadline_passed(ev)
+    if closed:
+        st.info(f"Registration for {ev['event_name']} has closed. {total} registered in total.",
+                icon=":material/lock:")
+    elif hours is None:
+        st.warning(f"Nobody has registered for {ev['event_name']} yet. Open the registration link yourself "
+                   "to make sure it works, then share it in the group.", icon=":material/warning:")
+    elif hours >= 48:
+        st.error(f"No new registrations for {ev['event_name']} in {int(hours // 24)} days. Open the registration link yourself to check it still works, "
+                 "then send a reminder in the group.", icon=":material/notification_important:")
+    elif hours >= 24:
+        st.warning(f"No new registrations in the last day (last one {fmt_ago(hours)}). Worth a reminder in the group.",
+                   icon=":material/schedule:")
+    else:
+        st.success(f"Registrations are coming in. The last one was {fmt_ago(hours)}.",
+                   icon=":material/check_circle:")
+    c = st.columns(3)
+    c[0].metric("Registered today", today_n)
+    c[1].metric("Last 7 days", week_n)
+    c[2].metric("Total so far", total)
+    st.bar_chart(chart, x="Day", y="Registrations", color=GOLD, x_label="", y_label="New registrations",
+                 height=220, sort=False)
+    st.caption("Days run midnight to midnight, Ghana time. A long flat run usually means the link needs "
+               "checking or the group needs a nudge.")
+
+
+def fmt_ago(hours: float) -> str:
+    if hours < 1:
+        return "less than an hour ago"
+    if hours < 24:
+        h = int(hours)
+        return f"{h} hour{'s' if h != 1 else ''} ago"
+    d = int(hours // 24)
+    return f"{d} day{'s' if d != 1 else ''} ago"
+
+
 def overview_tab():
     st.markdown(_with_heading_font(ADMIN_CSS), unsafe_allow_html=True)
     st.markdown(f'<div class="ig-greet">{esc(greeting_text())}</div>'
@@ -4370,6 +4436,8 @@ def overview_tab():
         st.warning("This copy isn't using a permanent disk, so a restart could clear the data. On Render, attach a "
                    "disk at /data. Until then, download a backup from the **Backup** tab after every event.",
                    icon=":material/backup:")
+    if ev and upcoming:
+        registration_pulse_panel(ev)
     birthdays_today_panel()
     summary = events_summary()
     if summary.empty:
