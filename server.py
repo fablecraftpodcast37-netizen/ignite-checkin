@@ -6,6 +6,7 @@ Render start command:
 `streamlit run app.py` still works too; it just runs without these extra headers.
 """
 import os
+from urllib.parse import urlsplit
 
 import streamlit as st
 from starlette.middleware import Middleware
@@ -53,6 +54,35 @@ class SecurityHeaders:
         await self.app(scope, receive, send_with_headers)
 
 
+class MoveToMainAddress:
+    """Sends anyone who opens the old *.onrender.com address on to the main address in
+    APP_BASE_URL (e.g. https://igniteprayernetwork.org), keeping the rest of the link, so
+    "/?event=5&mode=register" lands on the same page there.
+
+    Left alone: the live connection (websockets) and Streamlit's own /_stcore/ checks, so
+    pages that are already open and Render's health checks keep working. Uses a temporary
+    (302) redirect so browsers don't memorise it. Set REDIRECT_ONRENDER=off to switch it off."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and os.environ.get("REDIRECT_ONRENDER", "on").lower() != "off":
+            main = (os.environ.get("APP_BASE_URL") or "").strip().rstrip("/")
+            host = dict(scope.get("headers") or []).get(b"host", b"").decode("latin-1").split(":")[0].lower()
+            path = scope.get("path", "/")
+            if (main.startswith("https://") and host.endswith(".onrender.com")
+                    and urlsplit(main).hostname != host and not path.startswith("/_stcore/")):
+                qs = scope.get("query_string", b"").decode("latin-1")
+                target = main + path + (f"?{qs}" if qs else "")
+                await send({"type": "http.response.start", "status": 302,
+                            "headers": [(b"location", target.encode("latin-1")),
+                                        (b"cache-control", b"no-store"), (b"content-length", b"0")]})
+                await send({"type": "http.response.body", "body": b""})
+                return
+        await self.app(scope, receive, send)
+
+
 async def calendar_file(request):
     """/calendar/12.ics: the event as a calendar file. iPhones open it straight in the
     Calendar app ("Add All"); Android, Outlook and Google Calendar import it too."""
@@ -73,5 +103,5 @@ async def calendar_file(request):
     })
 
 
-app = st.App("app.py", middleware=[Middleware(SecurityHeaders)],
+app = st.App("app.py", middleware=[Middleware(SecurityHeaders), Middleware(MoveToMainAddress)],
              routes=[Route("/calendar/{event_id}.ics", calendar_file)])
