@@ -399,6 +399,7 @@ MIGRATIONS = [
     ("events", "about", "TEXT"),
     ("events", "map_url", "TEXT"),
     ("admins", "totp_secret", "TEXT"),
+    ("events", "checkin_auto", "INTEGER NOT NULL DEFAULT 1"),
     ("events", "rsvp_contacts", "TEXT"),
     ("events", "inviters", "TEXT"),
     ("attendance", "invited_by", "TEXT"),
@@ -614,7 +615,7 @@ def set_app_setting(key: str, value: str):
 
 
 # ----- events ---------------------------------------------------------------
-EVENT_COLUMNS = """e.id, e.event_name, e.event_type, e.event_date, e.venue, e.is_open,
+EVENT_COLUMNS = """e.id, e.event_name, e.event_type, e.event_date, e.venue, e.is_open, e.checkin_auto,
                    e.prereg_open, e.prereg_deadline, e.uses_checkin, e.created_at, e.flyer_bytes IS NOT NULL AS has_flyer,
                    e.start_time, e.end_time, e.theme, e.about, e.map_url, e.rsvp_contacts, e.inviters, e.ask_invited, e.dress_code, e.dress_colors,
                    (SELECT COUNT(*) FROM attendance a WHERE a.event_id = e.id) AS attendees,
@@ -622,13 +623,47 @@ EVENT_COLUMNS = """e.id, e.event_name, e.event_type, e.event_date, e.venue, e.is
 
 
 def get_events(open_only: bool = False) -> list[dict]:
-    where = "WHERE e.is_open = 1 AND e.uses_checkin = 1" if open_only else ""
     with closing(get_conn()) as conn:
         rows = conn.execute(
-            f"""SELECT {EVENT_COLUMNS} FROM events e {where}
+            f"""SELECT {EVENT_COLUMNS} FROM events e
                 ORDER BY COALESCE(e.event_date, date(e.created_at)) DESC, e.id DESC"""
         ).fetchall()
-        return [dict(r) for r in rows]
+    events = [dict(r) for r in rows]
+    return [e for e in events if checkin_live(e)] if open_only else events
+
+
+CHECKIN_AFTER_END_HOURS = 3     # automatic check-in stays open this long after the end time
+
+
+def checkin_live(ev: dict, now: datetime | None = None) -> bool:
+    """Is day-of check-in open right now? Automatic events (the default) open at midnight on the
+    event date (Ghana time) and close 3 hours after the end time, or at midnight if there's no
+    end time. An admin can still force it open or closed from the Events tab."""
+    if not ev.get("uses_checkin", 1):
+        return False
+    if not ev.get("checkin_auto", 1):
+        return bool(ev.get("is_open"))
+    try:
+        day = date.fromisoformat(str(ev.get("event_date") or "")[:10])
+    except ValueError:
+        return bool(ev.get("is_open"))     # no date set: fall back to the manual switch
+    now = now or datetime.now(timezone.utc).replace(tzinfo=None)     # Ghana is GMT all year
+    if now.date() != day:
+        return False
+    end = str(ev.get("end_time") or "")
+    if re.fullmatch(r"\d{2}:\d{2}", end):
+        closes = datetime.combine(day, datetime.strptime(end, "%H:%M").time()) + timedelta(hours=CHECKIN_AFTER_END_HOURS)
+        return now < closes
+    return True
+
+
+def checkin_window_text(ev: dict) -> str:
+    if not ev.get("event_date"):
+        return "set a date for the event to use automatic check-in"
+    end = str(ev.get("end_time") or "")
+    closes = (f"{fmt_time_short((datetime.strptime(end, '%H:%M') + timedelta(hours=CHECKIN_AFTER_END_HOURS)).strftime('%H:%M'))}"
+              if re.fullmatch(r"\d{2}:\d{2}", end) else "midnight")
+    return f"opens by itself on {fmt_date(ev['event_date'])} and closes at {closes} that day"
 
 
 def get_event(event_id: int):
@@ -694,7 +729,7 @@ def asks_invited(ev: dict) -> bool:
 
 
 def set_event_flag(event_id: int, column: str, value: bool):
-    if column not in ("is_open", "prereg_open"):
+    if column not in ("is_open", "prereg_open", "checkin_auto"):
         raise ValueError(f"Unknown event setting: {column}")
     with closing(get_conn()) as conn, conn:
         conn.execute(f"UPDATE events SET {column} = ? WHERE id = ?", (int(value), event_id))
@@ -1456,7 +1491,7 @@ def overview_stats() -> dict:
     with closing(get_conn()) as conn:
         return dict(conn.execute(
             """SELECT (SELECT COUNT(*) FROM events) AS events,
-                      (SELECT COUNT(*) FROM events WHERE is_open = 1 AND uses_checkin = 1) AS open_events,
+                      0 AS open_events,
                       (SELECT COUNT(*) FROM members) AS members,
                       (SELECT COUNT(*) FROM members WHERE country IS NOT NULL AND country <> 'Ghana') AS abroad,
                       (SELECT COUNT(*) FROM pre_registrations) AS preregs,
@@ -1483,7 +1518,8 @@ def events_summary() -> pd.DataFrame:
                             AND e.prereg_deadline <= strftime('%Y-%m-%d %H:%M', 'now') THEN 'Closed'
                        ELSE 'On' END AS "Pre-Registration",
                   CASE WHEN NOT e.uses_checkin THEN 'Not used'
-                       WHEN e.is_open THEN 'Open' ELSE 'Closed' END AS "Check-In"
+                       WHEN e.checkin_auto THEN 'Automatic'
+                       WHEN e.is_open THEN 'Open (by hand)' ELSE 'Closed (by hand)' END AS "Check-In"
            FROM events e
            ORDER BY COALESCE(e.event_date, date(e.created_at)) DESC, e.id DESC"""
     )
@@ -3506,7 +3542,7 @@ def checkin_page():
     if ev is None:
         return
     if (checkin_opens_later(ev) and ev.get("uses_checkin", 1)) or (
-            "event" not in st.query_params and not (ev.get("is_open") and ev.get("uses_checkin", 1))):
+            "event" not in st.query_params and not checkin_live(ev)):
         # The arrival link was shared early: until the day it takes registrations, not check-ins.
         register_flow(ev, banner, from_arrival_link=True)
         return
@@ -3516,13 +3552,14 @@ def checkin_page():
                      "This programme uses pre-registration only, so there's nothing to do here.")
         event_ticket(ev)
         return
+    if not checkin_live(ev):
+        page_heading("Arrival check-in", "Check-in is closed",
+                     "Check-in for this programme isn't open right now. If you're at the venue, please speak to an usher.")
+        event_ticket(ev)
+        return
     page_heading("Arrival check-in", "Welcome. Let's get you checked in.")
     event_ticket(ev)
     event_info_card(ev)
-    if not ev["is_open"]:
-        st.markdown('<div class="ig-note">Check-in for this programme is closed. '
-                    'Please speak to an usher if you need help.</div>', unsafe_allow_html=True)
-        return
 
     pending = st.session_state.get("chk_pending")
     if pending is None:
@@ -4560,7 +4597,7 @@ def overview_tab():
                  stack=False, color=[GOLD, ROYAL], x_label="People", y_label="")
     summary["Date"] = summary["Date"].map(fmt_date)
     st.dataframe(summary.drop(columns=["id"]), hide_index=True, width="stretch")
-    st.caption(f"{s['events']} event(s) in total, {s['open_events']} open for check-in · "
+    st.caption(f"{s['events']} event(s) in total, {len(get_events(open_only=True))} open for check-in · "
                f"{s['preregs']} pre-registrations and {s['checkins']} check-ins all time"
                + (" · saved on the permanent disk" if DB_IS_PERSISTENT else ""))
 
@@ -4685,13 +4722,29 @@ def checkin_qr_section(ev: dict, base):
                 "at the venue after all, change “How members take part” under **Edit details**.",
                 icon=":material/info:")
         return
-    status = ":green[●] **Check-in is open**" if ev["is_open"] else ":red[●] **Check-in is closed**"
+    live = checkin_live(ev)
+    status = ":green[●] **Check-in is open now**" if live else ":red[●] **Check-in is closed now**"
+    auto = bool(ev.get("checkin_auto", 1))
+    how = (f"Automatic: {checkin_window_text(ev)}." if auto
+           else "Set by hand. It stays like this until you change it or go back to automatic.")
     c1, c2 = st.columns([3, 1])
-    c1.markdown(f"{status} · {ev['attendees']} checked in")
-    if c2.button("Close check-in" if ev["is_open"] else "Reopen check-in", key=f"toggle_open_{ev['id']}", width="stretch"):
-        set_event_flag(ev["id"], "is_open", not ev["is_open"])
-        notify(f"Check-in {'closed' if ev['is_open'] else 'reopened'} for “{ev['event_name']}”.")
-        st.rerun()
+    c1.markdown(f"{status} · {ev['attendees']} checked in  \n:gray[{how}]")
+    if auto:
+        if c2.button("Close now" if live else "Open now", key=f"toggle_open_{ev['id']}", width="stretch",
+                     help="Overrides the automatic timing for this event."):
+            set_event_flag(ev["id"], "checkin_auto", False)
+            set_event_flag(ev["id"], "is_open", not live)
+            notify(f"Check-in {'closed' if live else 'opened'} by hand for “{ev['event_name']}”.")
+            st.rerun()
+    else:
+        if c2.button("Close check-in" if ev["is_open"] else "Open check-in", key=f"toggle_open_{ev['id']}", width="stretch"):
+            set_event_flag(ev["id"], "is_open", not ev["is_open"])
+            notify(f"Check-in {'closed' if ev['is_open'] else 'opened'} for “{ev['event_name']}”.")
+            st.rerun()
+        if c2.button("Back to automatic", key=f"auto_open_{ev['id']}", width="stretch", type="tertiary"):
+            set_event_flag(ev["id"], "checkin_auto", True)
+            notify(f"Check-in for “{ev['event_name']}” is back on automatic timing.")
+            st.rerun()
     if not base:
         st.warning("Set the app address above to get the check-in QR code.")
         return
