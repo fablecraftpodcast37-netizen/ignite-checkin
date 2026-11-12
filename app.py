@@ -398,6 +398,7 @@ MIGRATIONS = [
     ("events", "theme", "TEXT"),
     ("events", "about", "TEXT"),
     ("events", "map_url", "TEXT"),
+    ("admins", "totp_secret", "TEXT"),
     ("events", "rsvp_contacts", "TEXT"),
     ("events", "inviters", "TEXT"),
     ("attendance", "invited_by", "TEXT"),
@@ -1564,6 +1565,55 @@ def master_password():
     return None if master_password_problem() else get_setting("ADMIN_PASSWORD", "").strip()
 
 
+# ----- two-step sign-in (the 6-digit code from Google Authenticator, Microsoft Authenticator etc.) -----
+TOTP_ISSUER = "Ignite Prayer Network"
+
+
+def new_totp_secret() -> str:
+    return base64.b32encode(secrets.token_bytes(20)).decode().rstrip("=")
+
+
+def _totp_at(secret: str, counter: int) -> str:
+    key = base64.b32decode(secret + "=" * (-len(secret) % 8), casefold=True)
+    digest = hmac.new(key, counter.to_bytes(8, "big"), hashlib.sha1).digest()
+    off = digest[-1] & 0x0F
+    code = (int.from_bytes(digest[off:off + 4], "big") & 0x7FFFFFFF) % 1_000_000
+    return f"{code:06d}"
+
+
+def totp_ok(secret: str, code: str, now: float | None = None) -> bool:
+    """True if the code matches now, or 30 seconds either side (phone clocks drift a little)."""
+    code = re.sub(r"\s", "", code or "")
+    if not secret or not re.fullmatch(r"\d{6}", code):
+        return False
+    step = int((now if now is not None else time.time()) // 30)
+    return any(hmac.compare_digest(_totp_at(secret, step + d), code) for d in (-1, 0, 1))
+
+
+def totp_uri(secret: str, account: str) -> str:
+    return (f"otpauth://totp/{quote(TOTP_ISSUER)}:{quote(account)}?secret={secret}"
+            f"&issuer={quote(TOTP_ISSUER)}&digits=6&period=30")
+
+
+def admin_totp_secret(user: dict) -> str:
+    """The saved secret for this admin, or '' when they haven't turned two-step sign-in on.
+    The main administrator's lives in the settings table; OWNER_2FA=off in Render switches it off
+    (the way back in if that phone is lost)."""
+    if user.get("role") == "Owner":
+        if get_setting("OWNER_2FA").strip().lower() == "off":
+            return ""
+        return get_app_setting("owner_totp_secret")
+    row = get_admin(user["id"]) if user.get("id") else None
+    return (row or {}).get("totp_secret") or ""
+
+
+def save_admin_totp_secret(user: dict, secret: str):
+    if user.get("role") == "Owner":
+        set_app_setting("owner_totp_secret", secret)
+    else:
+        update_admin(user["id"], totp_secret=secret or None)
+
+
 def authenticate(username: str, password: str):
     username = (username or "").strip()
     password = password or ""
@@ -1612,7 +1662,7 @@ def list_admins() -> pd.DataFrame:
 
 
 def update_admin(admin_id: int, **fields):
-    allowed = {"role", "is_active", "password_hash", "full_name"}
+    allowed = {"role", "is_active", "password_hash", "full_name", "totp_secret"}
     cols = [c for c in fields if c in allowed]
     with closing(get_conn()) as conn, conn:
         conn.execute(f"UPDATE admins SET {', '.join(c + ' = ?' for c in cols)} WHERE id = ?",
@@ -4043,9 +4093,50 @@ def leave_admin():
     st.rerun()
 
 
+def second_step_login() -> bool:
+    """Shows the 6-digit code step when a password was right and the account uses two-step sign-in.
+    Returns True while this step is on screen."""
+    pending = st.session_state.get("pending_2fa")
+    if not pending:
+        return False
+    if pending["until"] < time.time():
+        st.session_state.pop("pending_2fa", None)
+        st.warning("That took too long. Please sign in again.")
+        return False
+    user = pending["user"]
+    st.info(f"Password accepted, {first_name(user['name'])}. Now open your authenticator app and enter "
+            "the 6-digit code for Ignite Prayer Network.", icon=":material/phonelink_lock:")
+    with st.form("admin_2fa", clear_on_submit=True):
+        code = st.text_input("6-digit code", max_chars=7, autocomplete="one-time-code", placeholder="123 456")
+        go = st.form_submit_button("Confirm", type="primary", width="stretch")
+    if go:
+        if rate_blocked("login_user", pending["key"]):
+            st.session_state.pop("pending_2fa", None)
+            st.error("Too many wrong codes. Please wait 15 minutes and try again.")
+        elif totp_ok(admin_totp_secret(user), code):
+            st.session_state.pop("pending_2fa", None)
+            st.session_state.admin_user = user
+            st.session_state.admin_expires = time.time() + ADMIN_SESSION_MINUTES * 60
+            st.session_state.failed_logins = 0
+            log_action("Signed in (with two-step code)")
+            st.rerun()
+        else:
+            time.sleep(1)
+            rate_note("login_user", pending["key"])
+            log_action(f"Wrong two-step code for “{clean_text(user['username'], 40)}” from {client_ip()}",
+                       actor="Unknown")
+            st.error("That code didn't match. Codes change every 30 seconds, so use the one showing now.")
+    if st.button("← Start again", key="cancel_2fa", type="tertiary"):
+        st.session_state.pop("pending_2fa", None)
+        st.rerun()
+    return True
+
+
 def admin_login():
     brand_row()
     page_heading("Admin", "Sign in", "For the Ignite team only.")
+    if second_step_login():
+        return
     locked_until = st.session_state.get("locked_until", 0)
     if locked_until > time.time() or rate_blocked("login_ip"):
         wait = max(int(locked_until - time.time()), 0)
@@ -4071,6 +4162,10 @@ def admin_login():
         go = False
     if go:
         user = authenticate(username, pw)
+        if user and admin_totp_secret(user):
+            # password is right; now the code from their phone
+            st.session_state.pending_2fa = {"user": user, "until": time.time() + 300, "key": user_key}
+            st.rerun()
         if user:
             st.session_state.admin_user = user
             st.session_state.admin_expires = time.time() + ADMIN_SESSION_MINUTES * 60
@@ -5545,8 +5640,9 @@ def account_section():
     user = current_admin()
     st.markdown("#### Your account")
     st.caption(f"Signed in as **{user['name']}** (username “{user['username']}”) · {user['role']}")
+    two_step_section(user)
     if user["role"] == "Owner":
-        st.caption("This is the main administrator account. Its password is set in Streamlit Secrets (ADMIN_PASSWORD).")
+        st.caption("This is the main administrator account. Its password is set in Render (ADMIN_PASSWORD).")
         return
     with st.form("change_own_password", clear_on_submit=True):
         c1, c2, c3 = st.columns(3)
@@ -5568,6 +5664,73 @@ def account_section():
             st.rerun()
 
 
+def two_step_section(user: dict):
+    st.markdown("##### Two-step sign-in")
+    secret = admin_totp_secret(user)
+    if secret:
+        st.success("On. Signing in needs your password and the 6-digit code from your phone.",
+                   icon=":material/verified_user:")
+        with st.expander("Turn two-step sign-in off"):
+            with st.form("totp_off", clear_on_submit=True):
+                code = st.text_input("Enter the current 6-digit code to confirm", max_chars=7)
+                off = st.form_submit_button("Turn off")
+            if off:
+                if totp_ok(secret, code):
+                    save_admin_totp_secret(user, "")
+                    notify("Turned off two-step sign-in.")
+                    st.rerun()
+                else:
+                    st.error("That code didn't match.")
+        return
+    st.caption("Optional, and strongly recommended for admins. Even if someone learns your password, "
+               "they can't sign in without the code from your phone.")
+    draft = st.session_state.get("totp_draft")
+    if not draft:
+        if st.button("Set up two-step sign-in", icon=":material/phonelink_lock:"):
+            st.session_state.totp_draft = new_totp_secret()
+            st.rerun()
+        return
+    st.markdown("1. Install **Google Authenticator** or **Microsoft Authenticator** on your phone.\n"
+                "2. In the app, tap **+** and scan this code:")
+    img = make_qr_image(totp_uri(draft, user["username"]))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    st.image(buf.getvalue(), width=200)
+    st.caption(f"Can't scan? Choose “enter a setup key” and type: `{' '.join(draft[i:i+4] for i in range(0, len(draft), 4))}`")
+    with st.form("totp_confirm", clear_on_submit=True):
+        code = st.text_input("3. Enter the 6-digit code the app shows", max_chars=7)
+        c1, c2 = st.columns(2)
+        ok = c1.form_submit_button("Turn on", type="primary")
+        cancel = c2.form_submit_button("Cancel")
+    if cancel:
+        st.session_state.pop("totp_draft", None)
+        st.rerun()
+    if ok:
+        if totp_ok(draft, code):
+            save_admin_totp_secret(user, draft)
+            st.session_state.pop("totp_draft", None)
+            notify("Turned on two-step sign-in.")
+            st.rerun()
+        else:
+            st.error("That code didn't match. Check your phone's time is set automatically, then try the newest code.")
+
+
+def reset_two_step_section():
+    """Main administrator only: switch two-step off for a team member who lost their phone."""
+    if current_admin().get("role") != "Owner":
+        return
+    rows = query_df("SELECT id, full_name, username FROM admins WHERE totp_secret IS NOT NULL AND totp_secret <> ''")
+    if rows.empty:
+        return
+    with st.expander(":material/phonelink_erase: Someone lost their phone? Reset their two-step sign-in"):
+        pick = st.selectbox("Team member", rows["id"].tolist(),
+                            format_func=lambda i: "{} ({})".format(*rows.loc[rows["id"] == i, ["full_name", "username"]].iloc[0]))
+        if st.button("Reset their two-step sign-in", key="reset_totp"):
+            update_admin(int(pick), totp_secret=None)
+            notify("Reset two-step sign-in for team member #{}.".format(int(pick)))
+            st.rerun()
+
+
 def team_tab():
     user = current_admin()
     st.markdown("#### Team members")
@@ -5575,6 +5738,7 @@ def team_tab():
     for role, desc in TEAM_ROLES.items():
         st.markdown(f"- **{role}:** {desc}")
     df = list_admins()
+    reset_two_step_section()
     with st.expander(":material/person_add: Add a team member", expanded=df.empty):
         with st.form("add_admin", clear_on_submit=True):
             c1, c2 = st.columns(2)
