@@ -60,6 +60,7 @@ from urllib.parse import quote, urlsplit
 import pandas as pd
 import qrcode
 import streamlit as st
+import streamlit.components.v1 as components
 try:
     import ignite_ics          # calendar files; the app still runs if this file wasn't uploaded
 except ImportError:
@@ -6122,6 +6123,38 @@ def admin_page():
 # ---------------------------------------------------------------------------
 # Router
 # ---------------------------------------------------------------------------
+def moved_to_main_address() -> bool:
+    """Someone opened the old *.onrender.com address: send their browser to the same page on
+    the main address (APP_BASE_URL, e.g. https://igniteprayernetwork.org). Only on the first
+    load of a visit, so a page that's already open is never pulled away mid-form.
+    REDIRECT_ONRENDER=off switches this off."""
+    first_load = not st.session_state.get("_address_checked")
+    st.session_state["_address_checked"] = True
+    if not first_load or os.environ.get("REDIRECT_ONRENDER", "on").lower() == "off":
+        return False
+    main_url = (os.environ.get("APP_BASE_URL") or "").strip().rstrip("/")
+    try:
+        here = urlsplit(st.context.url or "")
+    except Exception:
+        return False
+    host = (here.hostname or "").lower()
+    if not (main_url.startswith("https://") and host.endswith(".onrender.com")
+            and urlsplit(main_url).hostname != host):
+        return False
+    query = "&".join(f"{quote(str(k))}={quote(str(v))}" for k, v in st.query_params.items())
+    target = main_url + "/" + (f"?{query}" if query else "")
+    st.markdown(f"Moving you to our new address… If nothing happens, [tap here]({target}).")
+    # The component frame may not move the page itself (sandbox), so hand a one-line script to
+    # the main page, the same way the glass-light effect reaches it.
+    js_target = json.dumps(target)
+    components.html(
+        "<script>(function(){var u=" + js_target + ";try{var d=window.parent.document,"
+        "s=d.createElement('script');s.textContent='window.location.replace('+JSON.stringify(u)+')';"
+        "d.body.appendChild(s);}catch(e){try{window.top.location.replace(u);}catch(e2){}}})();</script>",
+        height=0)
+    return True
+
+
 def main():
     st.session_state.setdefault("form_nonce", 0)
     st.session_state.setdefault("show_admin", False)
@@ -6139,6 +6172,8 @@ def main():
     st.set_page_config(page_title=f"{titles[mode]} · {APP_NAME}", page_icon="🔥",
                        layout="wide" if mode == "admin" and logged_in else "centered",
                        initial_sidebar_state="collapsed")
+    if moved_to_main_address():
+        return
     init_db()
     inject_css(public=not (mode == "admin" and logged_in))
     if not (mode == "admin" and logged_in):
